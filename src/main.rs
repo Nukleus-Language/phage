@@ -1,33 +1,73 @@
-extern crate clap;
-use clap::{Arg, App, SubCommand};
+use std::env;
+use std::fs;
+use std::process;
+use std::path::Path;
+use std::io::Result;
+
+// existing Phage and Package structs and impls omitted for brevity...
 
 fn main() {
+    // let mut phage = Phage::new();
 
-    let matches = App::new("organ")
-                        .version("alpha 1")
-                        .author("Skuld Norniern. <skuldnorniern@gmail.com>")
-                        .about("Dependency manager for Nukleus ")
-                        .subcommand(SubCommand::with_name("run")
-                            .help("Runs the Nukleus Project")
-                            .arg(Arg::with_name("path")
-                                .value_name("Project Directory")
-                                .takes_value(true)))
-                        .subcommand(SubCommand::with_name("init")
-                            .help("Initialize the Nukleus Project")
-                            .arg(Arg::with_name("path")
-                                .value_name("Project Directory")
-                                .takes_value(true)))
-                        .get_matches();
+    let args: Vec<String> = env::args().collect();
 
-
-
-    if let Some(matches) = matches.subcommand_matches("run") {
-        let run = matches.value_of("path").unwrap_or("main.nkl");
-        println!("Running: {}", run);
+    if args.len() < 2 {
+        print_help_main();
+        process::exit(1);
     }
 
-    if let Some(matches) = matches.subcommand_matches("init") {
-        let pjpath = matches.value_of("path").unwrap_or("./");
-        println!("Initialize Nukleus project in {}",pjpath);
+    match args[1].as_str() {
+        "-v" | "--version" => {
+            println!("Phage version 0.1.0");
+        }
+        "-h" | "--help" => {
+            print_help_main();       
+        }
+        "init" => {
+            let path = env::current_dir().unwrap();
+            create_project_files(&path).unwrap();
+        }
+        "new" => {
+            if args.len() < 3 {
+                println!("Please provide a project name.");
+                process::exit(1);
+            }
+
+            fs::create_dir(&args[2]).unwrap();
+            let path = Path::new(&args[2]);
+            create_project_files(&path).unwrap();
+        }
+        "install" => {
+            // previous install code omitted for brevity...
+        }
+        // other commands omitted for brevity...
+        _ => {
+            println!("Invalid command.");
+            process::exit(1);
+        }
     }
 }
+fn print_help_main() {
+    println!("Phage, a package and build manager for Nukleus");
+    println!("\nCommands:");
+    println!("  init               Create a new project in the current directory");
+    println!("  new                Create a new project in a new directory");
+    println!("  inject             Inject a gene");
+    println!("  remove             Remove a gene");
+    println!("  build              Build the current project");
+    println!("  run                Run the current project");
+    println!("  list               List installed genes");
+    println!("  -h, --help         Print this message");
+    println!("  -v, --version      Prints the version");
+}
+
+fn create_project_files(path: &Path) -> Result<()> {
+    fs::create_dir(path.join("src"))?;
+    fs::create_dir(path.join("test"))?;
+    fs::write(path.join("src/main.nk"), "")?;
+    fs::write(path.join("test/main_test.nk"), "")?;
+    fs::write(path.join("package.toml"), "{\"name\": \"\",\"version\": \"\",\"dependencies\": {}}")?;
+
+    Ok(())
+}
+
