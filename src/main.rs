@@ -1,10 +1,16 @@
 use std::env;
 use std::fs;
-use std::process;
-use std::path::Path;
 use std::io::Result;
+use std::path::Path;
+use std::process;
+
+use inksac::types::*;
 
 // existing Phage and Package structs and impls omitted for brevity...
+const ERRORSTYLE: Style = Style {
+    forground: Some(Color::Red),
+    background: Some(Color::Black),
+};
 
 fn main() {
     // let mut phage = Phage::new();
@@ -21,7 +27,7 @@ fn main() {
             println!("Phage version 0.1.0");
         }
         "-h" | "--help" => {
-            print_help_main();       
+            print_help_main();
         }
         "init" => {
             let path = env::current_dir().unwrap();
@@ -35,30 +41,76 @@ fn main() {
 
             fs::create_dir(&args[2]).unwrap();
             let path = Path::new(&args[2]);
-            create_project_files(&path).unwrap();
+            create_project_files(path).unwrap();
         }
         "install" => {
             // previous install code omitted for brevity...
         }
         // other commands omitted for brevity...
         _ => {
-            println!("Invalid command.");
+            println!("{}", ColoredString::new("Invalid command.", ERRORSTYLE));
             process::exit(1);
         }
     }
 }
 fn print_help_main() {
-    println!("Phage, a package and build manager for Nukleus");
-    println!("\nCommands:");
-    println!("  init               Create a new project in the current directory");
-    println!("  new                Create a new project in a new directory");
-    println!("  inject             Inject a gene");
-    println!("  remove             Remove a gene");
-    println!("  build              Build the current project");
-    println!("  run                Run the current project");
-    println!("  list               List installed genes");
-    println!("  -h, --help         Print this message");
-    println!("  -v, --version      Prints the version");
+    let title_style = Style {
+        forground: Some(Color::Cyan),
+        ..Default::default()
+    };
+    let h2_style = Style {
+        forground: Some(Color::Yellow),
+        ..Default::default()
+    };
+    let h3_style = Style {
+        forground: Some(Color::Green),
+        ..Default::default()
+    };
+    let _test_style = Style {
+        forground: Some(Color::RGB(102, 103, 171)),
+        ..Default::default()
+    };
+    println!(
+        "{}, a package and build manager for Nukleus",
+        ColoredString::new("Phage", title_style)
+    );
+    println!("\n{}:", ColoredString::new("Commands", h2_style));
+    println!(
+        "  {}               Create a new project in the current directory",
+        ColoredString::new("init", h3_style)
+    );
+    println!(
+        "  {}                Create a new project in a new directory",
+        ColoredString::new("new", h3_style)
+    );
+    println!(
+        "  {}             Inject a gene",
+        ColoredString::new("inject", h3_style)
+    );
+    println!(
+        "  {}             Remove a gene",
+        ColoredString::new("remove", h3_style)
+    );
+    println!(
+        "  {}              Build the current project",
+        ColoredString::new("build", h3_style)
+    );
+    println!(
+        "  {}                Run the current project",
+        ColoredString::new("run", h3_style)
+    );
+    println!(
+        "  {}               List installed genes",
+        ColoredString::new("list", h3_style)
+    );
+    println!(
+        "  {}        Print this message",
+        ColoredString::new("-h, --help ", h3_style)
+    );
+    println!(
+        "  {}      Prints the version",
+        ColoredString::new("-v, --version", h3_style)
+    );
 }
 
 fn create_project_files(path: &Path) -> Result<()> {
@@ -66,8 +118,10 @@ fn create_project_files(path: &Path) -> Result<()> {
     fs::create_dir(path.join("test"))?;
     fs::write(path.join("src/main.nk"), "")?;
     fs::write(path.join("test/main_test.nk"), "")?;
-    fs::write(path.join("package.toml"), "{\"name\": \"\",\"version\": \"\",\"dependencies\": {}}")?;
+    fs::write(
+        path.join("package.toml"),
+        "{\"name\": \"\",\"version\": \"\",\"dependencies\": {}}",
+    )?;
 
     Ok(())
 }
-
