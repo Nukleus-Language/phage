@@ -114,13 +114,15 @@ fn print_help_main() {
 }
 
 fn create_project_files(path: &Path) -> Result<()> {
+    let project_name = path.file_name().unwrap().to_str().unwrap();
     fs::create_dir(path.join("src"))?;
-    fs::create_dir(path.join("test"))?;
+    //fs::create_dir(path.join("test"))?;
     fs::write(path.join("src/main.nk"), "")?;
-    fs::write(path.join("test/main_test.nk"), "")?;
+    //fs::write(path.join("test/main_test.nk"), "")?;
+    let toml_template = format!("[project]\nname: \"{}\"\nversion:\"0.1.0\"\n\n[dependencies]", project_name);
     fs::write(
-        path.join("package.toml"),
-        "{\"name\": \"\",\"version\": \"\",\"dependencies\": {}}",
+        path.join("Phage.toml"),
+        toml_template.as_bytes()
     )?;
 
     Ok(())
