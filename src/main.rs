@@ -1,15 +1,20 @@
-use std::env;
-use std::fs;
-use std::io::Result;
-use std::path::Path;
-use std::process;
-
+use std::{
+    env,
+    fs,
+    io::Result,
+    path::Path,
+    process,
+};
 use inksac::types::*;
 
 // existing Phage and Package structs and impls omitted for brevity...
 const ERRORSTYLE: Style = Style {
     forground: Some(Color::Red),
     background: Some(Color::Black),
+    bold: false,
+    dim: false,
+    underline: false,
+    italic: false,
 };
 
 fn main() {
