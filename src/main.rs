@@ -8,14 +8,7 @@ use std::{
 use inksac::types::*;
 
 // existing Phage and Package structs and impls omitted for brevity...
-const ERRORSTYLE: Style = Style {
-    forground: Some(Color::Red),
-    background: Some(Color::Black),
-    bold: false,
-    dim: false,
-    underline: false,
-    italic: false,
-};
+const ERRORSTYLE: Style = Style::builder().foreground(Some(Color::Red)).build();
 
 fn main() {
     // let mut phage = Phage::new();
@@ -60,19 +53,19 @@ fn main() {
 }
 fn print_help_main() {
     let title_style = Style {
-        forground: Some(Color::Cyan),
+        foreground: Some(Color::Cyan),
         ..Default::default()
     };
     let h2_style = Style {
-        forground: Some(Color::Yellow),
+        foreground: Some(Color::Yellow),
         ..Default::default()
     };
     let h3_style = Style {
-        forground: Some(Color::Green),
+        foreground: Some(Color::Green),
         ..Default::default()
     };
     let _test_style = Style {
-        forground: Some(Color::RGB(102, 103, 171)),
+        foreground: Some(Color::RGB(102, 103, 171)),
         ..Default::default()
     };
     println!(
