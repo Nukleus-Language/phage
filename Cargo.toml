@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-inksac = "0.2.0"
+inksac = "0.4.0"
 # clap = "2.33.3"
