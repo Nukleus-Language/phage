@@ -102,6 +102,14 @@ fn print_help_main() {
         ColoredString::new("new", h3_style)
     );
     println!(
+        "  {}              Build the project (--release for an optimized build)",
+        ColoredString::new("build", h3_style)
+    );
+    println!(
+        "  {}                Build and run the project (args after -- go to the program)",
+        ColoredString::new("run", h3_style)
+    );
+    println!(
         "  {}        Print this message",
         ColoredString::new("-h, --help ", h3_style)
     );
