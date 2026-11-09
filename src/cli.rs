@@ -39,6 +39,15 @@ pub fn run(args: &[String]) {
             let release = release_flag(&args[2..], "build").unwrap_or_else(|e| fail(&e));
             build::build(release).unwrap_or_else(|e| fail(&e));
         }
+        "run" => {
+            let (flags, program_args) = match args[2..].iter().position(|a| a == "--") {
+                Some(i) => (&args[2..2 + i], &args[3 + i..]),
+                None => (&args[2..], &args[args.len()..]),
+            };
+            let release = release_flag(flags, "run").unwrap_or_else(|e| fail(&e));
+            let code = build::run(release, program_args).unwrap_or_else(|e| fail(&e));
+            process::exit(code);
+        }
         "new" => {
             if args.len() < 3 {
                 println!("Please provide a project name.");

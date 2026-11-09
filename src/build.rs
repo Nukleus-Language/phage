@@ -7,7 +7,13 @@ use std::{
     process::Command,
 };
 
-pub fn build(release: bool) -> Result<PathBuf, String> {
+struct Target {
+    nukleus: OsString,
+    root: PathBuf,
+    name: String,
+}
+
+fn resolve() -> Result<Target, String> {
     let cwd =
         env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
     let manifest_path = find_manifest(&cwd).ok_or_else(|| {
@@ -22,8 +28,42 @@ pub fn build(release: bool) -> Result<PathBuf, String> {
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let manifest = manifest::load(&manifest_path)?;
-    let nukleus = env::var_os("NUKLEUS").unwrap_or_else(|| OsString::from("nukleus"));
-    build_with(&nukleus, &root, &manifest.project.name, release)
+    Ok(Target {
+        nukleus: env::var_os("NUKLEUS").unwrap_or_else(|| OsString::from("nukleus")),
+        root,
+        name: manifest.project.name,
+    })
+}
+
+pub fn build(release: bool) -> Result<PathBuf, String> {
+    let target = resolve()?;
+    build_with(&target.nukleus, &target.root, &target.name, release)
+}
+
+pub fn run(release: bool, program_args: &[String]) -> Result<i32, String> {
+    let target = resolve()?;
+    run_with(
+        &target.nukleus,
+        &target.root,
+        &target.name,
+        release,
+        program_args,
+    )
+}
+
+fn run_with(
+    nukleus: &OsStr,
+    root: &Path,
+    name: &str,
+    release: bool,
+    program_args: &[String],
+) -> Result<i32, String> {
+    let binary = build_with(nukleus, root, name, release)?;
+    let status = Command::new(&binary)
+        .args(program_args)
+        .status()
+        .map_err(|e| format!("Could not run '{}': {}", binary.display(), e))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn build_with(nukleus: &OsStr, root: &Path, name: &str, release: bool) -> Result<PathBuf, String> {
@@ -109,7 +149,13 @@ mod tests {
     mod fake {
         use super::*;
         use crate::testutil::temp_dir;
-        use std::os::unix::fs::PermissionsExt;
+        use std::{os::unix::fs::PermissionsExt, sync::Mutex};
+
+        static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
 
         const FAKE_NUKLEUS: &str = "#!/bin/sh
 out=\"\"
@@ -135,6 +181,7 @@ chmod +x \"$out\"
 
         #[test]
         fn build_creates_debug_binary() -> io::Result<()> {
+            let _guard = lock();
             let root = project("build")?;
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
@@ -149,6 +196,7 @@ chmod +x \"$out\"
 
         #[test]
         fn build_reports_nukleus_failure() -> io::Result<()> {
+            let _guard = lock();
             let root = project("fail")?;
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, "#!/bin/sh\nexit 3\n")?;
@@ -160,7 +208,22 @@ chmod +x \"$out\"
         }
 
         #[test]
+        fn run_returns_program_exit_code() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("run")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_NUKLEUS)?;
+
+            let code = run_with(nukleus.as_os_str(), &root, "demo", true, &[])
+                .map_err(io::Error::other)?;
+            assert_eq!(code, 7);
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+
+        #[test]
         fn build_reports_missing_nukleus() -> io::Result<()> {
+            let _guard = lock();
             let root = project("missing")?;
             let nukleus = root.join("no-such-nukleus");
 
