@@ -119,10 +119,40 @@ fn create_project_files(path: &Path) -> Result<()> {
     fs::write(path.join("src/main.nk"), "")?;
     //fs::write(path.join("test/main_test.nk"), "")?;
     let toml_template = format!(
-        "[project]\nname: \"{}\"\nversion:\"0.1.0\"\n\n[dependencies]",
+        "[project]\nname = \"{}\"\nversion = \"0.1.0\"\n\n[dependencies]\n",
         project_name
     );
     fs::write(path.join("Phage.toml"), toml_template.as_bytes())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phage_toml_is_valid_toml() -> Result<()> {
+        let base = env::temp_dir().join(format!(
+            "phage-test-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&base)?;
+        let project = base.join("demo");
+        fs::create_dir(&project)?;
+
+        create_project_files(&project)?;
+        let text = fs::read_to_string(project.join("Phage.toml"))?;
+        fs::remove_dir_all(&base)?;
+
+        assert_eq!(
+            text,
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+        );
+        Ok(())
+    }
 }
