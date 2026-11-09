@@ -1,4 +1,4 @@
-use crate::manifest;
+use crate::manifest::{self, FILE_NAME};
 use std::{
     fs,
     io::{self, ErrorKind},
@@ -15,9 +15,10 @@ pub fn init(path: &Path) -> io::Result<()> {
                 "project path has no UTF-8 file name",
             )
         })?;
+    let text = manifest::template(name).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     fs::create_dir(path.join("src"))?;
     fs::write(path.join("src/main.nk"), "")?;
-    fs::write(path.join("Phage.toml"), manifest::template(name).as_bytes())?;
+    fs::write(path.join(FILE_NAME), text.as_bytes())?;
 
     Ok(())
 }
@@ -37,23 +38,16 @@ pub fn new(dir: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::temp_dir;
 
     #[test]
     fn phage_toml_is_valid_toml() -> io::Result<()> {
-        let base = std::env::temp_dir().join(format!(
-            "phage-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        fs::create_dir_all(&base)?;
+        let base = temp_dir("init")?;
         let project = base.join("demo");
         fs::create_dir(&project)?;
 
         init(&project)?;
-        let text = fs::read_to_string(project.join("Phage.toml"))?;
+        let text = fs::read_to_string(project.join(FILE_NAME))?;
         fs::remove_dir_all(&base)?;
 
         assert_eq!(
