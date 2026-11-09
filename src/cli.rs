@@ -1,4 +1,4 @@
-use crate::project;
+use crate::{build, project};
 use inksac::{Color, ColoredString, Style};
 use std::{env, process};
 
@@ -35,6 +35,10 @@ pub fn run(args: &[String]) {
             project::init(&path)
                 .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
         }
+        "build" => {
+            let release = release_flag(&args[2..], "build").unwrap_or_else(|e| fail(&e));
+            build::build(release).unwrap_or_else(|e| fail(&e));
+        }
         "new" => {
             if args.len() < 3 {
                 println!("Please provide a project name.");
@@ -47,6 +51,19 @@ pub fn run(args: &[String]) {
             process::exit(1);
         }
     }
+}
+
+fn release_flag(args: &[String], command: &str) -> Result<bool, String> {
+    let mut release = false;
+    for arg in args {
+        match arg.as_str() {
+            "--release" => release = true,
+            other => {
+                return Err(format!("Unknown option '{}' for '{}'.", other, command));
+            }
+        }
+    }
+    Ok(release)
 }
 
 fn print_help_main() {

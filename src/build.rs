@@ -1,0 +1,173 @@
+use crate::manifest::{self, FILE_NAME, find_manifest};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+pub fn build(release: bool) -> Result<PathBuf, String> {
+    let cwd =
+        env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
+    let manifest_path = find_manifest(&cwd).ok_or_else(|| {
+        format!(
+            "No {} found in '{}' or any parent directory.",
+            FILE_NAME,
+            cwd.display()
+        )
+    })?;
+    let root = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let manifest = manifest::load(&manifest_path)?;
+    let nukleus = env::var_os("NUKLEUS").unwrap_or_else(|| OsString::from("nukleus"));
+    build_with(&nukleus, &root, &manifest.project.name, release)
+}
+
+fn build_with(nukleus: &OsStr, root: &Path, name: &str, release: bool) -> Result<PathBuf, String> {
+    let profile = if release { "release" } else { "debug" };
+    let out_dir = root.join("target").join(profile);
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+    let out = out_dir.join(name);
+    let (program, args) = compile_command(nukleus, &root.join("src/main.nk"), &out, release);
+    let status = Command::new(&program).args(&args).status().map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            format!(
+                "nukleus not found ('{}'): put it on PATH or set NUKLEUS to its path",
+                program.to_string_lossy()
+            )
+        } else {
+            format!("Could not run '{}': {}", program.to_string_lossy(), e)
+        }
+    })?;
+    if !status.success() {
+        return Err("build failed".to_string());
+    }
+    Ok(out)
+}
+
+fn compile_command(
+    nukleus: &OsStr,
+    input: &Path,
+    out: &Path,
+    release: bool,
+) -> (OsString, Vec<OsString>) {
+    let mut args = vec![OsString::from("-o"), out.into()];
+    if release {
+        args.push(OsString::from("-O2"));
+    }
+    args.push(input.into());
+    (nukleus.to_os_string(), args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_command_debug() {
+        let (program, args) = compile_command(
+            OsStr::new("nukleus"),
+            Path::new("/p/src/main.nk"),
+            Path::new("/p/target/debug/demo"),
+            false,
+        );
+        assert_eq!(program, OsString::from("nukleus"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-o"),
+                OsString::from("/p/target/debug/demo"),
+                OsString::from("/p/src/main.nk"),
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_command_release_optimizes() {
+        let (_, args) = compile_command(
+            OsStr::new("nukleus"),
+            Path::new("/p/src/main.nk"),
+            Path::new("/p/target/release/demo"),
+            true,
+        );
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-o"),
+                OsString::from("/p/target/release/demo"),
+                OsString::from("-O2"),
+                OsString::from("/p/src/main.nk"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    mod fake {
+        use super::*;
+        use crate::testutil::temp_dir;
+        use std::os::unix::fs::PermissionsExt;
+
+        const FAKE_NUKLEUS: &str = "#!/bin/sh
+out=\"\"
+while [ $# -gt 0 ]; do
+  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift; fi
+  shift
+done
+printf '#!/bin/sh\\necho built\\nexit 7\\n' > \"$out\"
+chmod +x \"$out\"
+";
+
+        fn write_exec(path: &Path, text: &str) -> io::Result<()> {
+            fs::write(path, text)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        }
+
+        fn project(tag: &str) -> io::Result<PathBuf> {
+            let root = temp_dir(tag)?;
+            fs::create_dir_all(root.join("src"))?;
+            fs::write(root.join("src/main.nk"), "")?;
+            Ok(root)
+        }
+
+        #[test]
+        fn build_creates_debug_binary() -> io::Result<()> {
+            let root = project("build")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_NUKLEUS)?;
+
+            let out =
+                build_with(nukleus.as_os_str(), &root, "demo", false).map_err(io::Error::other)?;
+            assert_eq!(out, root.join("target/debug/demo"));
+            assert!(out.is_file());
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+
+        #[test]
+        fn build_reports_nukleus_failure() -> io::Result<()> {
+            let root = project("fail")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, "#!/bin/sh\nexit 3\n")?;
+
+            let err = build_with(nukleus.as_os_str(), &root, "demo", true).unwrap_err();
+            assert_eq!(err, "build failed");
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+
+        #[test]
+        fn build_reports_missing_nukleus() -> io::Result<()> {
+            let root = project("missing")?;
+            let nukleus = root.join("no-such-nukleus");
+
+            let err = build_with(nukleus.as_os_str(), &root, "demo", false).unwrap_err();
+            assert!(err.contains("NUKLEUS"), "{err}");
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+    }
+}
