@@ -6,7 +6,6 @@ use std::{
     process,
 };
 
-// existing Phage and Package structs and impls omitted for brevity...
 const ERRORSTYLE: Style = Style {
     foreground: Color::Red,
     background: Color::Empty,
@@ -60,10 +59,6 @@ fn main() {
             create_project_files(Path::new(dir))
                 .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
         }
-        "install" => {
-            // previous install code omitted for brevity...
-        }
-        // other commands omitted for brevity...
         _ => {
             println!("{}", ColoredString::new("Invalid command.", ERRORSTYLE));
             process::exit(1);
@@ -99,26 +94,6 @@ fn print_help_main() {
     println!(
         "  {}                Create a new project in a new directory",
         ColoredString::new("new", h3_style)
-    );
-    println!(
-        "  {}             Inject a gene",
-        ColoredString::new("inject", h3_style)
-    );
-    println!(
-        "  {}             Remove a gene",
-        ColoredString::new("remove", h3_style)
-    );
-    println!(
-        "  {}              Build the current project",
-        ColoredString::new("build", h3_style)
-    );
-    println!(
-        "  {}                Run the current project",
-        ColoredString::new("run", h3_style)
-    );
-    println!(
-        "  {}               List installed genes",
-        ColoredString::new("list", h3_style)
     );
     println!(
         "  {}        Print this message",
