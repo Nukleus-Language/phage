@@ -1,5 +1,10 @@
 use inksac::{Color, ColoredString, Style};
-use std::{env, fs, io::Result, path::Path, process};
+use std::{
+    env, fs,
+    io::{self, ErrorKind, Result},
+    path::Path,
+    process,
+};
 
 // existing Phage and Package structs and impls omitted for brevity...
 const ERRORSTYLE: Style = Style {
@@ -10,6 +15,11 @@ const ERRORSTYLE: Style = Style {
     italic: false,
     underline: false,
 };
+
+fn fail(msg: &str) -> ! {
+    eprintln!("{}", ColoredString::new(msg, ERRORSTYLE));
+    process::exit(1);
+}
 
 fn main() {
     // let mut phage = Phage::new();
@@ -29,8 +39,10 @@ fn main() {
             print_help_main();
         }
         "init" => {
-            let path = env::current_dir().unwrap();
-            create_project_files(&path).unwrap();
+            let path = env::current_dir()
+                .unwrap_or_else(|e| fail(&format!("Could not read the current directory: {}", e)));
+            create_project_files(&path)
+                .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
         }
         "new" => {
             if args.len() < 3 {
@@ -38,9 +50,15 @@ fn main() {
                 process::exit(1);
             }
 
-            fs::create_dir(&args[2]).unwrap();
-            let path = Path::new(&args[2]);
-            create_project_files(path).unwrap();
+            let dir = &args[2];
+            if let Err(e) = fs::create_dir(dir) {
+                if e.kind() == ErrorKind::AlreadyExists {
+                    fail(&format!("Directory '{}' already exists.", dir));
+                }
+                fail(&format!("Could not create directory '{}': {}", dir, e));
+            }
+            create_project_files(Path::new(dir))
+                .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
         }
         "install" => {
             // previous install code omitted for brevity...
@@ -113,7 +131,15 @@ fn print_help_main() {
 }
 
 fn create_project_files(path: &Path) -> Result<()> {
-    let project_name = path.file_name().unwrap().to_str().unwrap();
+    let project_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "project path has no UTF-8 file name",
+            )
+        })?;
     fs::create_dir(path.join("src"))?;
     //fs::create_dir(path.join("test"))?;
     fs::write(path.join("src/main.nk"), "")?;
