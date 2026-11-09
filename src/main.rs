@@ -1,14 +1,15 @@
-use std::{
-    env,
-    fs,
-    io::Result,
-    path::Path,
-    process,
-};
-use inksac::types::*;
+use inksac::{Color, ColoredString, Style};
+use std::{env, fs, io::Result, path::Path, process};
 
 // existing Phage and Package structs and impls omitted for brevity...
-const ERRORSTYLE: Style = Style::builder().foreground(Some(Color::Red)).build();
+const ERRORSTYLE: Style = Style {
+    foreground: Color::Red,
+    background: Color::Empty,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+};
 
 fn main() {
     // let mut phage = Phage::new();
@@ -53,19 +54,19 @@ fn main() {
 }
 fn print_help_main() {
     let title_style = Style {
-        foreground: Some(Color::Cyan),
+        foreground: Color::Cyan,
         ..Default::default()
     };
     let h2_style = Style {
-        foreground: Some(Color::Yellow),
+        foreground: Color::Yellow,
         ..Default::default()
     };
     let h3_style = Style {
-        foreground: Some(Color::Green),
+        foreground: Color::Green,
         ..Default::default()
     };
     let _test_style = Style {
-        foreground: Some(Color::RGB(102, 103, 171)),
+        foreground: Color::RGB(102, 103, 171),
         ..Default::default()
     };
     println!(
@@ -117,11 +118,11 @@ fn create_project_files(path: &Path) -> Result<()> {
     //fs::create_dir(path.join("test"))?;
     fs::write(path.join("src/main.nk"), "")?;
     //fs::write(path.join("test/main_test.nk"), "")?;
-    let toml_template = format!("[project]\nname: \"{}\"\nversion:\"0.1.0\"\n\n[dependencies]", project_name);
-    fs::write(
-        path.join("Phage.toml"),
-        toml_template.as_bytes()
-    )?;
+    let toml_template = format!(
+        "[project]\nname: \"{}\"\nversion:\"0.1.0\"\n\n[dependencies]",
+        project_name
+    );
+    fs::write(path.join("Phage.toml"), toml_template.as_bytes())?;
 
     Ok(())
 }
