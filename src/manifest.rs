@@ -6,14 +6,36 @@ use std::{
 };
 
 pub const FILE_NAME: &str = "Phage.toml";
+const DEFAULT_LIB: &str = "src/lib.nk";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Manifest {
     pub project: Project,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lib: Option<Lib>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lints: BTreeMap<String, LintLevel>,
+}
+
+impl Manifest {
+    pub fn lib_path(&self) -> &Path {
+        self.lib
+            .as_ref()
+            .map_or(Path::new(DEFAULT_LIB), |lib| lib.path.as_path())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lib {
+    #[serde(default = "default_lib_path")]
+    pub path: PathBuf,
+}
+
+fn default_lib_path() -> PathBuf {
+    PathBuf::from(DEFAULT_LIB)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -53,6 +75,7 @@ pub fn template(name: &str) -> Result<String, toml::ser::Error> {
             name: name.to_string(),
             version: "0.1.0".to_string(),
         },
+        lib: None,
         dependencies: BTreeMap::new(),
         lints: BTreeMap::new(),
     })
@@ -175,6 +198,23 @@ mod tests {
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { git = \"https://example.com/json\" }\n",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lib_path_defaults_to_src_lib() -> Result<(), toml::de::Error> {
+        let manifest: Manifest =
+            toml::from_str("[project]\nname = \"demo\"\nversion = \"0.1.0\"\n")?;
+        assert_eq!(manifest.lib_path(), Path::new("src/lib.nk"));
+        Ok(())
+    }
+
+    #[test]
+    fn lib_path_reads_override() -> Result<(), toml::de::Error> {
+        let manifest: Manifest = toml::from_str(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/x.nk\"\n",
+        )?;
+        assert_eq!(manifest.lib_path(), Path::new("src/x.nk"));
+        Ok(())
     }
 
     #[test]

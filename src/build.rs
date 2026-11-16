@@ -1,4 +1,7 @@
-use crate::manifest::{self, Dependency, FILE_NAME, LintLevel, Manifest, find_manifest};
+use crate::{
+    deps,
+    manifest::{self, FILE_NAME, LintLevel, Manifest, find_manifest},
+};
 use std::{
     collections::BTreeMap,
     env,
@@ -78,13 +81,13 @@ fn build_with(
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let out = out_dir.join(&manifest.project.name);
-    let deps = dependency_roots(root, &manifest.dependencies);
+    let genes = deps::collect(root, manifest)?;
     let (program, args) = compile_command(&CompileCommand {
         nukleus,
         input: &root.join("src/main.nk"),
         out: &out,
         release,
-        deps: &deps,
+        deps: &genes,
         lints: &manifest.lints,
     });
     let status = Command::new(&program).args(&args).status().map_err(|e| {
@@ -101,16 +104,6 @@ fn build_with(
         return Err("build failed".to_string());
     }
     Ok(out)
-}
-
-fn dependency_roots(
-    root: &Path,
-    dependencies: &BTreeMap<String, Dependency>,
-) -> Vec<(String, PathBuf)> {
-    dependencies
-        .iter()
-        .map(|(name, dep)| (name.clone(), root.join(&dep.path).join("src/lib.nk")))
-        .collect()
 }
 
 struct CompileCommand<'a> {
@@ -228,21 +221,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn path_dependency_root_is_its_lib_file() {
-        let mut dependencies = BTreeMap::new();
-        dependencies.insert(
-            "json".to_string(),
-            Dependency {
-                path: PathBuf::from("../json"),
-            },
-        );
-        assert_eq!(
-            dependency_roots(Path::new("/p"), &dependencies),
-            vec![("json".to_string(), PathBuf::from("/p/../json/src/lib.nk"))]
-        );
-    }
-
     #[cfg(unix)]
     mod fake {
         use super::*;
@@ -283,6 +261,7 @@ chmod +x \"$out\"
                     name: "demo".to_string(),
                     version: "0.1.0".to_string(),
                 },
+                lib: None,
                 dependencies: BTreeMap::new(),
                 lints: BTreeMap::new(),
             }
