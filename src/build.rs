@@ -39,9 +39,58 @@ fn resolve() -> Result<Target, String> {
     })
 }
 
-pub fn build(release: bool) -> Result<PathBuf, String> {
+const BIN_ROOT: &str = "src/main.nk";
+
+struct Roots {
+    bin: Option<PathBuf>,
+    lib: Option<PathBuf>,
+}
+
+fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
+    let bin = root.join(BIN_ROOT);
+    let lib = root.join(manifest.lib_path());
+    let roots = Roots {
+        bin: bin.is_file().then_some(bin),
+        lib: lib.is_file().then_some(lib),
+    };
+    if roots.bin.is_none() && roots.lib.is_none() {
+        return Err(format!(
+            "No binary root ({}) or library root ({}) found.",
+            BIN_ROOT,
+            manifest.lib_path().display()
+        ));
+    }
+    Ok(roots)
+}
+
+pub fn build(release: bool) -> Result<(), String> {
     let target = resolve()?;
-    build_with(&target.nukleus, &target.root, &target.manifest, release)
+    if let Some(note) = build_roots(&target.nukleus, &target.root, &target.manifest, release)? {
+        println!("{}", note);
+    }
+    Ok(())
+}
+
+fn build_roots(
+    nukleus: &OsStr,
+    root: &Path,
+    manifest: &Manifest,
+    release: bool,
+) -> Result<Option<String>, String> {
+    let roots = roots(root, manifest)?;
+    if roots.bin.is_some() {
+        build_with(nukleus, root, manifest, release)?;
+    }
+    let Some(lib) = roots.lib else {
+        return Ok(None);
+    };
+    check_inputs(nukleus, root, manifest, &[lib.as_path()])?;
+    Ok(roots.bin.is_none().then(|| {
+        format!(
+            "No library artifact format yet; checked {}.",
+            manifest.lib_path().display()
+        )
+    }))
 }
 
 pub fn run(release: bool, program_args: &[String]) -> Result<i32, String> {
@@ -76,15 +125,36 @@ pub fn check() -> Result<(), String> {
 }
 
 fn check_with(nukleus: &OsStr, root: &Path, manifest: &Manifest) -> Result<(), String> {
+    let roots = roots(root, manifest)?;
+    let inputs: Vec<&Path> = roots
+        .bin
+        .iter()
+        .chain(roots.lib.iter())
+        .map(PathBuf::as_path)
+        .collect();
+    check_inputs(nukleus, root, manifest, &inputs)
+}
+
+fn check_inputs(
+    nukleus: &OsStr,
+    root: &Path,
+    manifest: &Manifest,
+    inputs: &[&Path],
+) -> Result<(), String> {
     let out_dir = root.join("target").join("check");
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
-    compile(
-        nukleus,
-        root,
-        manifest,
-        &Output::Check { out_dir: &out_dir },
-    )
+    let graph = deps::collect(root, manifest)?;
+    for input in inputs {
+        compile(
+            nukleus,
+            input,
+            &Output::Check { out_dir: &out_dir },
+            &graph,
+            &manifest.lints,
+        )?;
+    }
+    Ok(())
 }
 
 fn build_with(
@@ -93,36 +163,41 @@ fn build_with(
     manifest: &Manifest,
     release: bool,
 ) -> Result<PathBuf, String> {
+    let bin = roots(root, manifest)?
+        .bin
+        .ok_or_else(|| format!("no binary root: {} not found", BIN_ROOT))?;
     let profile = if release { "release" } else { "debug" };
     let out_dir = root.join("target").join(profile);
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let out = out_dir.join(&manifest.project.name);
+    let graph = deps::collect(root, manifest)?;
     compile(
         nukleus,
-        root,
-        manifest,
+        &bin,
         &Output::Binary {
             path: &out,
             release,
         },
+        &graph,
+        &manifest.lints,
     )?;
     Ok(out)
 }
 
 fn compile(
     nukleus: &OsStr,
-    root: &Path,
-    manifest: &Manifest,
+    input: &Path,
     output: &Output,
+    graph: &Graph,
+    lints: &BTreeMap<String, LintLevel>,
 ) -> Result<(), String> {
-    let graph = deps::collect(root, manifest)?;
     let (program, args) = compile_command(&CompileCommand {
         nukleus,
-        input: &root.join("src/main.nk"),
+        input,
         output,
-        graph: &graph,
-        lints: &manifest.lints,
+        graph,
+        lints,
     });
     let status = Command::new(&program).args(&args).status().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
@@ -478,12 +553,113 @@ chmod +x \"$out\"
 
         const FAKE_CHECK: &str = "#!/bin/sh
 dir=\"\"
+last=\"\"
 while [ $# -gt 0 ]; do
   if [ \"$1\" = \"--out-dir\" ]; then dir=\"$2\"; shift; fi
+  last=\"$1\"
   shift
 done
-mkdir -p \"$dir\" && echo ir > \"$dir/main.lamina\"
+mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
 ";
+
+        fn lib_only(tag: &str) -> io::Result<PathBuf> {
+            let root = project(tag)?;
+            fs::remove_file(root.join("src/main.nk"))?;
+            fs::write(root.join("src/lib.nk"), "")?;
+            Ok(root)
+        }
+
+        #[test]
+        fn check_lib_only_checks_lib_root() -> io::Result<()> {
+            let _guard = lock();
+            let root = lib_only("check_lib")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_CHECK)?;
+
+            check_with(nukleus.as_os_str(), &root, &demo()).map_err(io::Error::other)?;
+            let written = root.join("target/check/lib.lamina").is_file();
+            fs::remove_dir_all(&root)?;
+            assert!(written);
+            Ok(())
+        }
+
+        #[test]
+        fn check_checks_both_roots_when_present() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("check_both")?;
+            fs::write(root.join("src/lib.nk"), "")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_CHECK)?;
+
+            check_with(nukleus.as_os_str(), &root, &demo()).map_err(io::Error::other)?;
+            let written = root.join("target/check/main.lamina").is_file()
+                && root.join("target/check/lib.lamina").is_file();
+            fs::remove_dir_all(&root)?;
+            assert!(written);
+            Ok(())
+        }
+
+        #[test]
+        fn build_lib_only_checks_and_notes() -> io::Result<()> {
+            let _guard = lock();
+            let root = lib_only("build_lib")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_CHECK)?;
+
+            let note = build_roots(nukleus.as_os_str(), &root, &demo(), false)
+                .map_err(io::Error::other)?;
+            let checked = root.join("target/check/lib.lamina").is_file();
+            let no_binary = !root.join("target/debug/demo").exists();
+            fs::remove_dir_all(&root)?;
+            assert_eq!(
+                note.as_deref(),
+                Some("No library artifact format yet; checked src/lib.nk.")
+            );
+            assert!(checked && no_binary);
+            Ok(())
+        }
+
+        #[test]
+        fn build_with_binary_root_has_no_note() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("build_bin")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_NUKLEUS)?;
+
+            let note = build_roots(nukleus.as_os_str(), &root, &demo(), false)
+                .map_err(io::Error::other)?;
+            let built = root.join("target/debug/demo").is_file();
+            fs::remove_dir_all(&root)?;
+            assert_eq!(note, None);
+            assert!(built);
+            Ok(())
+        }
+
+        #[test]
+        fn run_lib_only_reports_no_binary_root() -> io::Result<()> {
+            let _guard = lock();
+            let root = lib_only("run_lib")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_CHECK)?;
+
+            let err = run_with(nukleus.as_os_str(), &root, &demo(), false, &[]).unwrap_err();
+            let checked = root.join("target/check/lib.lamina").exists();
+            fs::remove_dir_all(&root)?;
+            assert!(err.starts_with("no binary root"), "{err}");
+            assert!(!checked);
+            Ok(())
+        }
+
+        #[test]
+        fn roots_error_without_any_root() -> io::Result<()> {
+            let root = project("no_roots")?;
+            fs::remove_file(root.join("src/main.nk"))?;
+
+            let err = roots(&root, &demo()).err().unwrap_or_default();
+            fs::remove_dir_all(&root)?;
+            assert!(err.contains("No binary root"), "{err}");
+            Ok(())
+        }
 
         #[test]
         fn check_writes_ir_under_target_check() -> io::Result<()> {
