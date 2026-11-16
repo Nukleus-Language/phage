@@ -40,24 +40,23 @@ pub fn run(args: &[String]) {
                 .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
         }
         "build" => {
-            let flags = flags(&args[2..], "build").unwrap_or_else(|e| fail(&e));
-            build::build(flags.release, flags.locked).unwrap_or_else(|e| fail(&e));
+            let opts = flags(&args[2..], "build").unwrap_or_else(|e| fail(&e));
+            build::build(opts).unwrap_or_else(|e| fail(&e));
         }
         "check" => {
-            let flags = flags(&args[2..], "check").unwrap_or_else(|e| fail(&e));
-            if flags.release {
+            let opts = flags(&args[2..], "check").unwrap_or_else(|e| fail(&e));
+            if opts.release {
                 fail("Unknown option '--release' for 'check'.");
             }
-            build::check(flags.locked).unwrap_or_else(|e| fail(&e));
+            build::check(opts).unwrap_or_else(|e| fail(&e));
         }
         "run" => {
             let (opts, program_args) = match args[2..].iter().position(|a| a == "--") {
                 Some(i) => (&args[2..2 + i], &args[3 + i..]),
                 None => (&args[2..], &args[args.len()..]),
             };
-            let flags = flags(opts, "run").unwrap_or_else(|e| fail(&e));
-            let code =
-                build::run(flags.release, flags.locked, program_args).unwrap_or_else(|e| fail(&e));
+            let opts = flags(opts, "run").unwrap_or_else(|e| fail(&e));
+            let code = build::run(opts, program_args).unwrap_or_else(|e| fail(&e));
             process::exit(code);
         }
         "new" => {
@@ -96,18 +95,13 @@ fn scaffold_args<'a>(
     Ok((name, kind))
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Flags {
-    release: bool,
-    locked: bool,
-}
-
-fn flags(args: &[String], command: &str) -> Result<Flags, String> {
-    let mut flags = Flags::default();
+fn flags(args: &[String], command: &str) -> Result<build::Options, String> {
+    let mut flags = build::Options::default();
     for arg in args {
         match arg.as_str() {
             "--release" => flags.release = true,
             "--locked" => flags.locked = true,
+            "--offline" => flags.offline = true,
             other => {
                 return Err(format!("Unknown option '{}' for '{}'.", other, command));
             }
@@ -147,7 +141,7 @@ fn print_help_main() {
         ColoredString::new("check", h3_style)
     );
     println!(
-        "  {}              Build the project (--release for an optimized build, --locked to fail if Phage.lock would change)",
+        "  {}              Build the project (--release for an optimized build, --locked to fail if Phage.lock would change, --offline to use only the git cache)",
         ColoredString::new("build", h3_style)
     );
     println!(
@@ -199,12 +193,24 @@ mod tests {
     }
 
     #[test]
+    fn flags_accept_offline() {
+        assert_eq!(
+            flags(&args(&["--offline"]), "run"),
+            Ok(build::Options {
+                offline: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
     fn flags_accept_release_and_locked_together() {
         assert_eq!(
             flags(&args(&["--locked", "--release"]), "build"),
-            Ok(Flags {
+            Ok(build::Options {
                 release: true,
                 locked: true,
+                offline: false,
             })
         );
     }

@@ -1,4 +1,7 @@
-use crate::manifest::{self, FILE_NAME, LintLevel, Manifest};
+use crate::{
+    git::Store,
+    manifest::{self, Dependency, FILE_NAME, LintLevel, Manifest},
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -17,13 +20,25 @@ pub struct Gene {
     pub root: PathBuf,
     pub deps: Vec<(String, PathBuf)>,
     pub lints: BTreeMap<String, LintLevel>,
+    pub source: Source,
     pub(crate) dir: PathBuf,
 }
 
-pub fn collect(root: &Path, manifest: &Manifest) -> Result<Graph, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Path,
+    Git { url: String, sha: String },
+}
+
+pub fn collect(root: &Path, manifest: &Manifest, store: &Store) -> Result<Graph, String> {
     let root = fs::canonicalize(root)
         .map_err(|e| format!("Could not resolve '{}': {}", root.display(), e))?;
-    let mut walk = Walk::default();
+    let mut walk = Walk {
+        store,
+        genes: BTreeMap::new(),
+        packages: BTreeMap::new(),
+        stack: Vec::new(),
+    };
     walk.stack
         .push((manifest.project.name.clone(), root.clone()));
     let deps = walk.visit(manifest, &root)?;
@@ -33,26 +48,18 @@ pub fn collect(root: &Path, manifest: &Manifest) -> Result<Graph, String> {
     })
 }
 
-#[derive(Default)]
-struct Walk {
+struct Walk<'a> {
+    store: &'a Store,
     genes: BTreeMap<String, Gene>,
     packages: BTreeMap<PathBuf, String>,
     stack: Vec<(String, PathBuf)>,
 }
 
-impl Walk {
+impl Walk<'_> {
     fn visit(&mut self, manifest: &Manifest, dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
         let mut declared = Vec::new();
         for (name, dep) in &manifest.dependencies {
-            let candidate = dir.join(&dep.path);
-            let canon = fs::canonicalize(&candidate).map_err(|e| {
-                format!(
-                    "Could not resolve dependency '{}' at '{}': {}",
-                    name,
-                    candidate.display(),
-                    e
-                )
-            })?;
+            let (canon, source) = self.locate(name, dep, dir)?;
 
             if let Some(start) = self.stack.iter().position(|(_, seen)| *seen == canon) {
                 let mut chain: Vec<&str> = self.stack[start..]
@@ -105,6 +112,7 @@ impl Walk {
                     root: root.clone(),
                     deps: Vec::new(),
                     lints: dep_manifest.lints.clone(),
+                    source,
                     dir: canon.clone(),
                 },
             );
@@ -117,6 +125,41 @@ impl Walk {
             declared.push((name.clone(), root));
         }
         Ok(declared)
+    }
+
+    fn locate(
+        &self,
+        name: &str,
+        dep: &Dependency,
+        dir: &Path,
+    ) -> Result<(PathBuf, Source), String> {
+        match dep {
+            Dependency::Path(path) => {
+                let candidate = dir.join(&path.path);
+                let canon = fs::canonicalize(&candidate).map_err(|e| {
+                    format!(
+                        "Could not resolve dependency '{}' at '{}': {}",
+                        name,
+                        candidate.display(),
+                        e
+                    )
+                })?;
+                Ok((canon, Source::Path))
+            }
+            Dependency::Git(git) => {
+                let checkout = self.store.checkout(name, git)?;
+                let canon = fs::canonicalize(&checkout.dir).map_err(|e| {
+                    format!("Could not resolve '{}': {}", checkout.dir.display(), e)
+                })?;
+                Ok((
+                    canon,
+                    Source::Git {
+                        url: git.git.clone(),
+                        sha: checkout.sha,
+                    },
+                ))
+            }
+        }
     }
 }
 
@@ -161,7 +204,12 @@ mod tests {
         let dep = package(&base, "dep", &[], Some("src/x.nk"))?;
         let expected = fs::canonicalize(&dep)?.join("src/x.nk");
 
-        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
         assert_eq!(graph.deps, vec![("dep".to_string(), expected)]);
         Ok(())
@@ -175,7 +223,12 @@ mod tests {
         package(&base, "b", &[("c", "../c")], None)?;
         package(&base, "c", &[], None)?;
 
-        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
         assert_eq!(names(&graph.genes), ["a", "b", "c"]);
         assert!(
@@ -196,7 +249,12 @@ mod tests {
         package(&base, "c", &[("d", "../d")], None)?;
         package(&base, "d", &[], None)?;
 
-        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
         assert_eq!(names(&graph.genes), ["a", "b", "c", "d"]);
         Ok(())
@@ -217,7 +275,12 @@ mod tests {
         let b_root = fs::canonicalize(base.join("b"))?.join("src/lib.nk");
         let c_root = fs::canonicalize(base.join("c"))?.join("src/lib.nk");
 
-        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
         assert_eq!(graph.deps, vec![("a".to_string(), a_root)]);
         let [gene_a, gene_b, gene_c] = graph.genes.as_slice() else {
@@ -253,7 +316,12 @@ mod tests {
         let x1 = fs::canonicalize(base.join("x1"))?;
         let x2 = fs::canonicalize(base.join("x2"))?;
 
-        let err = collect(&root, &load_root(&root)?).unwrap_err();
+        let err = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .unwrap_err();
         fs::remove_dir_all(&base)?;
         assert!(err.contains(&x1.display().to_string()), "{err}");
         assert!(err.contains(&x2.display().to_string()), "{err}");
@@ -267,7 +335,12 @@ mod tests {
         package(&base, "a", &[("b", "../b")], None)?;
         package(&base, "b", &[("a", "../a")], None)?;
 
-        let err = collect(&root, &load_root(&root)?).unwrap_err();
+        let err = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .unwrap_err();
         fs::remove_dir_all(&base)?;
         assert_eq!(err, "Dependency cycle: a -> b -> a");
         Ok(())
@@ -279,10 +352,79 @@ mod tests {
         let root = package(&base, "root", &[("a", "../a")], None)?;
         fs::create_dir_all(base.join("a"))?;
 
-        let err = collect(&root, &load_root(&root)?).unwrap_err();
+        let err = collect(
+            &root,
+            &load_root(&root)?,
+            &Store::new(base.join("home"), false),
+        )
+        .unwrap_err();
         fs::remove_dir_all(&base)?;
         assert!(err.contains("has no Phage.toml"), "{err}");
         assert!(err.contains("'a'"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn git_dependencies_of_git_dependencies_are_walked() -> io::Result<()> {
+        use crate::testutil::{commit, git_out, init_repo};
+        let base = temp_dir("git_chain")?;
+        let repo_b = init_repo(&base, "b")?;
+        let b_manifest = "[project]\nname = \"b\"\nversion = \"0.1.0\"\n";
+        commit(
+            &repo_b,
+            &[("Phage.toml", b_manifest), ("src/lib.nk", "")],
+            "b",
+        )?;
+        let sha_b = git_out(&repo_b, &["rev-parse", "HEAD"])?;
+        let url_b = format!("file://{}", repo_b.display());
+
+        let repo_a = init_repo(&base, "a")?;
+        let a_manifest = format!(
+            "[project]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nb = {{ git = \"{url_b}\" }}\n"
+        );
+        let sha_a = commit(
+            &repo_a,
+            &[("Phage.toml", a_manifest.as_str()), ("src/lib.nk", "")],
+            "a",
+        )?;
+        let url_a = format!("file://{}", repo_a.display());
+
+        let root = package(&base, "root", &[], None)?;
+        let root_manifest = format!(
+            "[project]\nname = \"root\"\nversion = \"0.1.0\"\n\n[dependencies]\na = {{ git = \"{url_a}\" }}\n"
+        );
+        fs::write(root.join(FILE_NAME), root_manifest)?;
+        let store = Store::new(base.join("home"), false);
+
+        let graph = collect(&root, &load_root(&root)?, &store);
+        let result = graph.map(|g| {
+            (
+                g.genes
+                    .iter()
+                    .map(|gene| gene.name.clone())
+                    .collect::<Vec<_>>(),
+                g.genes
+                    .iter()
+                    .map(|gene| gene.source.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        fs::remove_dir_all(&base)?;
+        let (names, sources) = result.map_err(io::Error::other)?;
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(
+            sources,
+            vec![
+                Source::Git {
+                    url: url_a,
+                    sha: sha_a
+                },
+                Source::Git {
+                    url: url_b,
+                    sha: sha_b
+                },
+            ]
+        );
         Ok(())
     }
 }

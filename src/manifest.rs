@@ -46,9 +46,26 @@ pub struct Project {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Dependency {
+    Git(GitDependency),
+    Path(PathDependency),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Dependency {
+pub struct PathDependency {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitDependency {
+    pub git: String,
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -188,14 +205,39 @@ mod tests {
         let manifest: Manifest = toml::from_str(
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { path = \"../json\" }\n",
         )?;
-        assert_eq!(manifest.dependencies["json"].path, PathBuf::from("../json"));
+        let Dependency::Path(json) = &manifest.dependencies["json"] else {
+            panic!("path dependency");
+        };
+        assert_eq!(json.path, PathBuf::from("../json"));
         Ok(())
     }
 
     #[test]
-    fn rejects_dependency_without_path_source() {
+    fn parses_git_dependency_with_rev() -> Result<(), toml::de::Error> {
+        let manifest: Manifest = toml::from_str(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { git = \"https://example.com/json\", rev = \"v1\" }\n",
+        )?;
+        let Dependency::Git(json) = &manifest.dependencies["json"] else {
+            panic!("git dependency");
+        };
+        assert_eq!(json.git, "https://example.com/json");
+        assert_eq!(json.rev.as_deref(), Some("v1"));
+        assert_eq!(json.branch, None);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dependency_with_path_and_git() {
         let result = toml::from_str::<Manifest>(
-            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { git = \"https://example.com/json\" }\n",
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { path = \"../json\", git = \"https://example.com/json\" }\n",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_dependency_without_source() {
+        let result = toml::from_str::<Manifest>(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { rev = \"v1\" }\n",
         );
         assert!(result.is_err());
     }

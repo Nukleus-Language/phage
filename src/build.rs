@@ -1,5 +1,6 @@
 use crate::{
     deps::{self, Gene, Graph},
+    git::Store,
     lock,
     manifest::{self, FILE_NAME, LintLevel, Manifest, find_manifest},
 };
@@ -12,13 +13,21 @@ use std::{
     process::Command,
 };
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    pub release: bool,
+    pub locked: bool,
+    pub offline: bool,
+}
+
 struct Target {
     nukleus: OsString,
     root: PathBuf,
     manifest: Manifest,
+    store: Store,
 }
 
-fn resolve() -> Result<Target, String> {
+fn resolve(offline: bool) -> Result<Target, String> {
     let cwd =
         env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
     let manifest_path = find_manifest(&cwd).ok_or_else(|| {
@@ -37,6 +46,7 @@ fn resolve() -> Result<Target, String> {
         nukleus: env::var_os("NUKLEUS").unwrap_or_else(|| OsString::from("nukleus")),
         root,
         manifest,
+        store: Store::from_env(offline)?,
     })
 }
 
@@ -65,14 +75,20 @@ fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
 }
 
 fn sync_lock(target: &Target, locked: bool) -> Result<(), String> {
-    let graph = deps::collect(&target.root, &target.manifest)?;
+    let graph = deps::collect(&target.root, &target.manifest, &target.store)?;
     lock::sync(&target.root, &graph, locked)
 }
 
-pub fn build(release: bool, locked: bool) -> Result<(), String> {
-    let target = resolve()?;
-    sync_lock(&target, locked)?;
-    if let Some(note) = build_roots(&target.nukleus, &target.root, &target.manifest, release)? {
+pub fn build(opts: Options) -> Result<(), String> {
+    let target = resolve(opts.offline)?;
+    sync_lock(&target, opts.locked)?;
+    if let Some(note) = build_roots(
+        &target.nukleus,
+        &target.root,
+        &target.manifest,
+        &target.store,
+        opts.release,
+    )? {
         println!("{}", note);
     }
     Ok(())
@@ -82,16 +98,17 @@ fn build_roots(
     nukleus: &OsStr,
     root: &Path,
     manifest: &Manifest,
+    store: &Store,
     release: bool,
 ) -> Result<Option<String>, String> {
     let roots = roots(root, manifest)?;
     if roots.bin.is_some() {
-        build_with(nukleus, root, manifest, release)?;
+        build_with(nukleus, root, manifest, store, release)?;
     }
     let Some(lib) = roots.lib else {
         return Ok(None);
     };
-    check_inputs(nukleus, root, manifest, &[lib.as_path()])?;
+    check_inputs(nukleus, root, manifest, store, &[lib.as_path()])?;
     Ok(roots.bin.is_none().then(|| {
         format!(
             "No library artifact format yet; checked {}.",
@@ -100,14 +117,15 @@ fn build_roots(
     }))
 }
 
-pub fn run(release: bool, locked: bool, program_args: &[String]) -> Result<i32, String> {
-    let target = resolve()?;
-    sync_lock(&target, locked)?;
+pub fn run(opts: Options, program_args: &[String]) -> Result<i32, String> {
+    let target = resolve(opts.offline)?;
+    sync_lock(&target, opts.locked)?;
     run_with(
         &target.nukleus,
         &target.root,
         &target.manifest,
-        release,
+        &target.store,
+        opts.release,
         program_args,
     )
 }
@@ -116,10 +134,11 @@ fn run_with(
     nukleus: &OsStr,
     root: &Path,
     manifest: &Manifest,
+    store: &Store,
     release: bool,
     program_args: &[String],
 ) -> Result<i32, String> {
-    let binary = build_with(nukleus, root, manifest, release)?;
+    let binary = build_with(nukleus, root, manifest, store, release)?;
     let status = Command::new(&binary)
         .args(program_args)
         .status()
@@ -127,13 +146,23 @@ fn run_with(
     Ok(status.code().unwrap_or(1))
 }
 
-pub fn check(locked: bool) -> Result<(), String> {
-    let target = resolve()?;
-    sync_lock(&target, locked)?;
-    check_with(&target.nukleus, &target.root, &target.manifest)
+pub fn check(opts: Options) -> Result<(), String> {
+    let target = resolve(opts.offline)?;
+    sync_lock(&target, opts.locked)?;
+    check_with(
+        &target.nukleus,
+        &target.root,
+        &target.manifest,
+        &target.store,
+    )
 }
 
-fn check_with(nukleus: &OsStr, root: &Path, manifest: &Manifest) -> Result<(), String> {
+fn check_with(
+    nukleus: &OsStr,
+    root: &Path,
+    manifest: &Manifest,
+    store: &Store,
+) -> Result<(), String> {
     let roots = roots(root, manifest)?;
     let inputs: Vec<&Path> = roots
         .bin
@@ -141,19 +170,20 @@ fn check_with(nukleus: &OsStr, root: &Path, manifest: &Manifest) -> Result<(), S
         .chain(roots.lib.iter())
         .map(PathBuf::as_path)
         .collect();
-    check_inputs(nukleus, root, manifest, &inputs)
+    check_inputs(nukleus, root, manifest, store, &inputs)
 }
 
 fn check_inputs(
     nukleus: &OsStr,
     root: &Path,
     manifest: &Manifest,
+    store: &Store,
     inputs: &[&Path],
 ) -> Result<(), String> {
     let out_dir = root.join("target").join("check");
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
-    let graph = deps::collect(root, manifest)?;
+    let graph = deps::collect(root, manifest, store)?;
     for input in inputs {
         compile(
             nukleus,
@@ -170,6 +200,7 @@ fn build_with(
     nukleus: &OsStr,
     root: &Path,
     manifest: &Manifest,
+    store: &Store,
     release: bool,
 ) -> Result<PathBuf, String> {
     let bin = roots(root, manifest)?
@@ -180,7 +211,7 @@ fn build_with(
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let out = out_dir.join(&manifest.project.name);
-    let graph = deps::collect(root, manifest)?;
+    let graph = deps::collect(root, manifest, store)?;
     compile(
         nukleus,
         &bin,
@@ -425,6 +456,7 @@ mod tests {
                     deps: vec![("b".to_string(), PathBuf::from("/p/b/src/lib.nk"))],
                     lints: BTreeMap::from([("never_mutated".to_string(), LintLevel::Deny)]),
                     dir: PathBuf::from("/p/a"),
+                    source: deps::Source::Path,
                 },
                 Gene {
                     name: "b".to_string(),
@@ -432,6 +464,7 @@ mod tests {
                     deps: Vec::new(),
                     lints: BTreeMap::new(),
                     dir: PathBuf::from("/p/b"),
+                    source: deps::Source::Path,
                 },
             ],
         };
@@ -463,6 +496,10 @@ mod tests {
     #[cfg(unix)]
     mod fake {
         use super::*;
+
+        fn store(root: &Path) -> Store {
+            Store::new(root.join("home"), false)
+        }
         use crate::{manifest::Project, testutil::temp_dir};
         use std::{os::unix::fs::PermissionsExt, sync::Mutex};
 
@@ -513,8 +550,8 @@ chmod +x \"$out\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
 
-            let out =
-                build_with(nukleus.as_os_str(), &root, &demo(), false).map_err(io::Error::other)?;
+            let out = build_with(nukleus.as_os_str(), &root, &demo(), &store(&root), false)
+                .map_err(io::Error::other)?;
             assert_eq!(out, root.join("target/debug/demo"));
             assert!(out.is_file());
             fs::remove_dir_all(&root)?;
@@ -528,7 +565,8 @@ chmod +x \"$out\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, "#!/bin/sh\nexit 3\n")?;
 
-            let err = build_with(nukleus.as_os_str(), &root, &demo(), true).unwrap_err();
+            let err =
+                build_with(nukleus.as_os_str(), &root, &demo(), &store(&root), true).unwrap_err();
             assert_eq!(err, "build failed");
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -541,8 +579,15 @@ chmod +x \"$out\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
 
-            let code = run_with(nukleus.as_os_str(), &root, &demo(), true, &[])
-                .map_err(io::Error::other)?;
+            let code = run_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                true,
+                &[],
+            )
+            .map_err(io::Error::other)?;
             assert_eq!(code, 7);
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -554,7 +599,8 @@ chmod +x \"$out\"
             let root = project("missing")?;
             let nukleus = root.join("no-such-nukleus");
 
-            let err = build_with(nukleus.as_os_str(), &root, &demo(), false).unwrap_err();
+            let err =
+                build_with(nukleus.as_os_str(), &root, &demo(), &store(&root), false).unwrap_err();
             assert!(err.contains("NUKLEUS"), "{err}");
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -585,7 +631,8 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            check_with(nukleus.as_os_str(), &root, &demo()).map_err(io::Error::other)?;
+            check_with(nukleus.as_os_str(), &root, &demo(), &store(&root))
+                .map_err(io::Error::other)?;
             let written = root.join("target/check/lib.lamina").is_file();
             fs::remove_dir_all(&root)?;
             assert!(written);
@@ -600,7 +647,8 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            check_with(nukleus.as_os_str(), &root, &demo()).map_err(io::Error::other)?;
+            check_with(nukleus.as_os_str(), &root, &demo(), &store(&root))
+                .map_err(io::Error::other)?;
             let written = root.join("target/check/main.lamina").is_file()
                 && root.join("target/check/lib.lamina").is_file();
             fs::remove_dir_all(&root)?;
@@ -615,7 +663,7 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            let note = build_roots(nukleus.as_os_str(), &root, &demo(), false)
+            let note = build_roots(nukleus.as_os_str(), &root, &demo(), &store(&root), false)
                 .map_err(io::Error::other)?;
             let checked = root.join("target/check/lib.lamina").is_file();
             let no_binary = !root.join("target/debug/demo").exists();
@@ -635,7 +683,7 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
 
-            let note = build_roots(nukleus.as_os_str(), &root, &demo(), false)
+            let note = build_roots(nukleus.as_os_str(), &root, &demo(), &store(&root), false)
                 .map_err(io::Error::other)?;
             let built = root.join("target/debug/demo").is_file();
             fs::remove_dir_all(&root)?;
@@ -651,7 +699,15 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            let err = run_with(nukleus.as_os_str(), &root, &demo(), false, &[]).unwrap_err();
+            let err = run_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+                &[],
+            )
+            .unwrap_err();
             let checked = root.join("target/check/lib.lamina").exists();
             fs::remove_dir_all(&root)?;
             assert!(err.starts_with("no binary root"), "{err}");
@@ -677,7 +733,8 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            check_with(nukleus.as_os_str(), &root, &demo()).map_err(io::Error::other)?;
+            check_with(nukleus.as_os_str(), &root, &demo(), &store(&root))
+                .map_err(io::Error::other)?;
             assert!(root.join("target/check/main.lamina").is_file());
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -690,7 +747,7 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, "#!/bin/sh\nexit 1\n")?;
 
-            let err = check_with(nukleus.as_os_str(), &root, &demo()).unwrap_err();
+            let err = check_with(nukleus.as_os_str(), &root, &demo(), &store(&root)).unwrap_err();
             assert_eq!(err, "check failed");
             fs::remove_dir_all(&root)?;
             Ok(())

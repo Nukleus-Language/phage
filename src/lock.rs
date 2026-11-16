@@ -1,4 +1,7 @@
-use crate::deps::{Gene, Graph};
+use crate::{
+    deps::{Gene, Graph, Source},
+    git::redact,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -48,12 +51,19 @@ fn render(root: &Path, genes: &[Gene]) -> Result<String, String> {
         .map(|gene| {
             Ok(Entry {
                 name: gene.name.clone(),
-                source: slash(&relative(&root, &gene.dir)),
+                source: source(&root, gene),
                 sha256: digest(&gene.dir)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     toml::to_string(&Lock { gene }).map_err(|e| format!("Could not render {}: {}", FILE_NAME, e))
+}
+
+fn source(root: &Path, gene: &Gene) -> String {
+    match &gene.source {
+        Source::Path => slash(&relative(root, &gene.dir)),
+        Source::Git { url, sha } => format!("git+{}#{}", redact(url), sha),
+    }
 }
 
 fn digest(dir: &Path) -> Result<String, String> {
@@ -134,8 +144,27 @@ mod tests {
             root: dir.join("src/lib.nk"),
             deps: Vec::new(),
             lints: BTreeMap::new(),
+            source: Source::Path,
             dir,
         })
+    }
+
+    #[test]
+    fn git_gene_records_url_and_resolved_sha() -> io::Result<()> {
+        let base = temp_dir("git_source")?;
+        let root = base.join("root");
+        fs::create_dir_all(root.join("src"))?;
+        let mut json = gene(&base, "json", &[("src/a.nk", "x")])?;
+        json.source = Source::Git {
+            url: "https://example.com/json.git".to_string(),
+            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        };
+        let text = render(&root, &[json]).map_err(io::Error::other);
+        fs::remove_dir_all(&base)?;
+        assert!(text?.contains(
+            "source = \"git+https://example.com/json.git#0123456789abcdef0123456789abcdef01234567\""
+        ));
+        Ok(())
     }
 
     fn graph(genes: Vec<Gene>) -> Graph {
@@ -270,6 +299,27 @@ mod tests {
         fs::remove_dir_all(&base)?;
         assert!(result.is_err());
         assert!(!exists);
+        Ok(())
+    }
+
+    #[test]
+    fn git_source_in_lock_drops_credentials() -> io::Result<()> {
+        let base = temp_dir("git_redact_lock")?;
+        let root = base.join("root");
+        fs::create_dir_all(root.join("src"))?;
+        let mut json = gene(&base, "json", &[("src/a.nk", "x")])?;
+        json.source = Source::Git {
+            url: "https://user:secret@example.com/json.git".to_string(),
+            sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        };
+        let text = render(&root, &[json]).map_err(io::Error::other);
+        fs::remove_dir_all(&base)?;
+        let text = text?;
+        assert!(
+            text.contains("source = \"git+https://example.com/json.git#0123456789abcdef0123456789abcdef01234567\""),
+            "{text}"
+        );
+        assert!(!text.contains("secret"), "{text}");
         Ok(())
     }
 
