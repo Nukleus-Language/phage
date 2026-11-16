@@ -50,6 +50,11 @@ pub fn run(args: &[String]) {
             }
             build::check(opts).unwrap_or_else(|e| fail(&e));
         }
+        "test" => {
+            let (opts, filter) = test_flags(&args[2..]).unwrap_or_else(|e| fail(&e));
+            let code = build::test(opts, filter.as_deref()).unwrap_or_else(|e| fail(&e));
+            process::exit(code);
+        }
         "run" => {
             let (opts, program_args) = match args[2..].iter().position(|a| a == "--") {
                 Some(i) => (&args[2..2 + i], &args[3 + i..]),
@@ -110,6 +115,26 @@ fn flags(args: &[String], command: &str) -> Result<build::Options, String> {
     Ok(flags)
 }
 
+fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), String> {
+    let mut opts = build::Options::default();
+    let mut filter = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--locked" => opts.locked = true,
+            "--offline" => opts.offline = true,
+            "--filter" => {
+                let value = rest
+                    .next()
+                    .ok_or_else(|| "'--filter' needs a value.".to_string())?;
+                filter = Some(value.clone());
+            }
+            other => return Err(format!("Unknown option '{}' for 'test'.", other)),
+        }
+    }
+    Ok((opts, filter))
+}
+
 fn print_help_main() {
     let title_style = Style {
         foreground: Color::Cyan,
@@ -143,6 +168,10 @@ fn print_help_main() {
     println!(
         "  {}              Build the project (--release for an optimized build, --locked to fail if Phage.lock would change, --offline to use only the git cache)",
         ColoredString::new("build", h3_style)
+    );
+    println!(
+        "  {}                Build and run the tests of the project (--filter <text> runs only tests whose module.name contains text)",
+        ColoredString::new("test", h3_style)
     );
     println!(
         "  {}                Build and run the project (args after -- go to the program)",
@@ -219,6 +248,21 @@ mod tests {
     fn flags_reject_unknown_option() {
         let err = flags(&args(&["--frozen"]), "build").unwrap_err();
         assert_eq!(err, "Unknown option '--frozen' for 'build'.");
+    }
+
+    #[test]
+    fn test_flags_take_filter_and_reject_release() {
+        let (opts, filter) = test_flags(&args(&["--filter", "geom", "--locked"])).unwrap();
+        assert!(opts.locked);
+        assert_eq!(filter.as_deref(), Some("geom"));
+        assert_eq!(
+            test_flags(&args(&["--release"])).unwrap_err(),
+            "Unknown option '--release' for 'test'."
+        );
+        assert_eq!(
+            test_flags(&args(&["--filter"])).unwrap_err(),
+            "'--filter' needs a value."
+        );
     }
 
     #[test]

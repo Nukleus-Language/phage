@@ -74,6 +74,63 @@ fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
     Ok(roots)
 }
 
+pub fn test(opts: Options, filter: Option<&str>) -> Result<i32, String> {
+    let target = resolve(opts.offline)?;
+    sync_lock(&target, opts.locked)?;
+    test_with(
+        &target.nukleus,
+        &target.root,
+        &target.manifest,
+        &target.store,
+        filter,
+    )
+}
+
+/// Builds and runs a test runner for each root. Every root runs even if an earlier one fails;
+/// the result is the first nonzero exit code, or 0.
+fn test_with(
+    nukleus: &OsStr,
+    root: &Path,
+    manifest: &Manifest,
+    store: &Store,
+    filter: Option<&str>,
+) -> Result<i32, String> {
+    let roots = roots(root, manifest)?;
+    let out_dir = root.join("target").join("test");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+    let graph = deps::collect(root, manifest, store)?;
+    let mut targets: Vec<(&Path, String)> = Vec::new();
+    if let Some(bin) = &roots.bin {
+        targets.push((bin.as_path(), manifest.project.name.clone()));
+    }
+    if let Some(lib) = &roots.lib {
+        targets.push((lib.as_path(), format!("{}-lib", manifest.project.name)));
+    }
+    let mut code = 0;
+    for (input, name) in targets {
+        let path = out_dir.join(name);
+        compile(
+            nukleus,
+            input,
+            &Output::Test {
+                path: &path,
+                filter,
+            },
+            &graph,
+            &manifest.lints,
+        )?;
+        let status = Command::new(&path)
+            .current_dir(root)
+            .status()
+            .map_err(|e| format!("Could not run '{}': {}", path.display(), e))?;
+        if code == 0 {
+            code = status.code().unwrap_or(1);
+        }
+    }
+    Ok(code)
+}
+
 fn sync_lock(target: &Target, locked: bool) -> Result<(), String> {
     let graph = deps::collect(&target.root, &target.manifest, &target.store)?;
     lock::sync(&target.root, &graph, locked)
@@ -256,8 +313,17 @@ fn compile(
 }
 
 enum Output<'a> {
-    Binary { path: &'a Path, release: bool },
-    Check { out_dir: &'a Path },
+    Binary {
+        path: &'a Path,
+        release: bool,
+    },
+    Check {
+        out_dir: &'a Path,
+    },
+    Test {
+        path: &'a Path,
+        filter: Option<&'a str>,
+    },
 }
 
 impl Output<'_> {
@@ -265,6 +331,7 @@ impl Output<'_> {
         match self {
             Output::Binary { .. } => "build failed",
             Output::Check { .. } => "check failed",
+            Output::Test { .. } => "test build failed",
         }
     }
 }
@@ -292,6 +359,15 @@ fn compile_command(cmd: &CompileCommand) -> (OsString, Vec<OsString>) {
             args.push(OsString::from("ir"));
             args.push(OsString::from("--out-dir"));
             args.push(out_dir.into());
+        }
+        Output::Test { path, filter } => {
+            args.push(OsString::from("--test"));
+            if let Some(filter) = filter {
+                args.push(OsString::from("--test-filter"));
+                args.push(OsString::from(filter));
+            }
+            args.push(OsString::from("-o"));
+            args.push(path.into());
         }
     }
     for (name, path) in &cmd.graph.deps {
@@ -378,6 +454,32 @@ mod tests {
             deps: Vec::new(),
             genes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn compile_command_test_builds_runner_with_filter() {
+        let (program, args) = compile_command(&CompileCommand {
+            nukleus: OsStr::new("nukleus"),
+            input: Path::new("/p/src/main.nk"),
+            output: &Output::Test {
+                path: Path::new("/p/target/test/demo"),
+                filter: Some("geom"),
+            },
+            graph: &no_graph(),
+            lints: &BTreeMap::new(),
+        });
+        assert_eq!(program, OsString::from("nukleus"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--test"),
+                OsString::from("--test-filter"),
+                OsString::from("geom"),
+                OsString::from("-o"),
+                OsString::from("/p/target/test/demo"),
+                OsString::from("/p/src/main.nk"),
+            ]
+        );
     }
 
     #[test]
@@ -737,6 +839,54 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
                 .map_err(io::Error::other)?;
             assert!(root.join("target/check/main.lamina").is_file());
             fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+
+        #[test]
+        fn test_runs_runner_and_returns_its_exit_code() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("test_run")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_NUKLEUS)?;
+
+            let code = test_with(nukleus.as_os_str(), &root, &demo(), &store(&root), None)
+                .map_err(io::Error::other)?;
+            assert_eq!(code, 7);
+            assert!(root.join("target/test/demo").is_file());
+            Ok(())
+        }
+
+        #[test]
+        fn test_lib_only_builds_lib_runner() -> io::Result<()> {
+            let _guard = lock();
+            let root = lib_only("test_lib")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_NUKLEUS)?;
+
+            let code = test_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                Some("x"),
+            )
+            .map_err(io::Error::other)?;
+            assert_eq!(code, 7);
+            assert!(root.join("target/test/demo-lib").is_file());
+            assert!(!root.join("target/test/demo").exists());
+            Ok(())
+        }
+
+        #[test]
+        fn test_reports_runner_build_failure() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("test_fail")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, "#!/bin/sh\nexit 1\n")?;
+
+            let err =
+                test_with(nukleus.as_os_str(), &root, &demo(), &store(&root), None).unwrap_err();
+            assert_eq!(err, "test build failed");
             Ok(())
         }
 
