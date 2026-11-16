@@ -30,9 +30,13 @@ pub fn run(args: &[String]) {
             print_help_main();
         }
         "init" => {
+            let (name, kind) = scaffold_args(&args[2..], "init").unwrap_or_else(|e| fail(&e));
+            if name.is_some() {
+                fail("'init' takes no project name; use 'new' for a new directory.");
+            }
             let path = env::current_dir()
                 .unwrap_or_else(|e| fail(&format!("Could not read the current directory: {}", e)));
-            project::init(&path)
+            project::init(&path, kind)
                 .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
         }
         "build" => {
@@ -55,17 +59,39 @@ pub fn run(args: &[String]) {
             process::exit(code);
         }
         "new" => {
-            if args.len() < 3 {
-                println!("Please provide a project name.");
-                process::exit(1);
-            }
-            project::new(&args[2]).unwrap_or_else(|e| fail(&e));
+            let (name, kind) = scaffold_args(&args[2..], "new").unwrap_or_else(|e| fail(&e));
+            let name = name.unwrap_or_else(|| fail("Please provide a project name."));
+            project::new(name, kind).unwrap_or_else(|e| fail(&e));
         }
         _ => {
             println!("{}", ColoredString::new("Invalid command.", ERRORSTYLE));
             process::exit(1);
         }
     }
+}
+
+fn scaffold_args<'a>(
+    args: &'a [String],
+    command: &str,
+) -> Result<(Option<&'a str>, project::Kind), String> {
+    let mut name = None;
+    let mut kind = project::Kind::Bin;
+    for arg in args {
+        match arg.as_str() {
+            "--lib" => kind = project::Kind::Lib,
+            other if other.starts_with('-') => {
+                return Err(format!("Unknown option '{}' for '{}'.", other, command));
+            }
+            other if name.is_none() => name = Some(other),
+            other => {
+                return Err(format!(
+                    "Unexpected argument '{}' for '{}'.",
+                    other, command
+                ));
+            }
+        }
+    }
+    Ok((name, kind))
 }
 
 fn release_flag(args: &[String], command: &str) -> Result<bool, String> {
@@ -100,11 +126,11 @@ fn print_help_main() {
     );
     println!("\n{}:", ColoredString::new("Commands", h2_style));
     println!(
-        "  {}               Create a new project in the current directory",
+        "  {}               Create a new project in the current directory (--lib for a library)",
         ColoredString::new("init", h3_style)
     );
     println!(
-        "  {}                Create a new project in a new directory",
+        "  {}                Create a new project in a new directory (--lib for a library)",
         ColoredString::new("new", h3_style)
     );
     println!(
@@ -127,4 +153,45 @@ fn print_help_main() {
         "  {}      Prints the version",
         ColoredString::new("-v, --version", h3_style)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn scaffold_args_takes_name_and_lib_flag_in_either_order() {
+        assert_eq!(
+            scaffold_args(&args(&["--lib", "demo"]), "new"),
+            Ok((Some("demo"), project::Kind::Lib))
+        );
+        assert_eq!(
+            scaffold_args(&args(&["demo"]), "new"),
+            Ok((Some("demo"), project::Kind::Bin))
+        );
+    }
+
+    #[test]
+    fn scaffold_args_without_name_is_none() {
+        assert_eq!(
+            scaffold_args(&args(&[]), "init"),
+            Ok((None, project::Kind::Bin))
+        );
+    }
+
+    #[test]
+    fn scaffold_args_rejects_unknown_option() {
+        let err = scaffold_args(&args(&["--bin", "demo"]), "new").unwrap_err();
+        assert_eq!(err, "Unknown option '--bin' for 'new'.");
+    }
+
+    #[test]
+    fn scaffold_args_rejects_second_name() {
+        let err = scaffold_args(&args(&["a", "b"]), "new").unwrap_err();
+        assert_eq!(err, "Unexpected argument 'b' for 'new'.");
+    }
 }

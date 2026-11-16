@@ -5,7 +5,29 @@ use std::{
     path::Path,
 };
 
-pub fn init(path: &Path) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Bin,
+    Lib,
+}
+
+impl Kind {
+    fn root(self) -> &'static str {
+        match self {
+            Kind::Bin => "src/main.nk",
+            Kind::Lib => "src/lib.nk",
+        }
+    }
+
+    fn source(self) -> &'static str {
+        match self {
+            Kind::Bin => "fn main() -> i32 {\n    return 0;\n}\n",
+            Kind::Lib => "fn answer() -> i32 {\n    return 42;\n}\n",
+        }
+    }
+}
+
+pub fn init(path: &Path, kind: Kind) -> io::Result<()> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -17,13 +39,13 @@ pub fn init(path: &Path) -> io::Result<()> {
         })?;
     let text = manifest::template(name).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     fs::create_dir(path.join("src"))?;
-    fs::write(path.join("src/main.nk"), "")?;
+    fs::write(path.join(kind.root()), kind.source())?;
     fs::write(path.join(FILE_NAME), text.as_bytes())?;
 
     Ok(())
 }
 
-pub fn new(dir: &str) -> Result<(), String> {
+pub fn new(dir: &str, kind: Kind) -> Result<(), String> {
     let path = Path::new(dir);
     fs::create_dir(path).map_err(|e| {
         if e.kind() == ErrorKind::AlreadyExists {
@@ -32,7 +54,7 @@ pub fn new(dir: &str) -> Result<(), String> {
             format!("Could not create directory '{}': {}", dir, e)
         }
     })?;
-    init(path).map_err(|e| format!("Could not create project: {}", e))
+    init(path, kind).map_err(|e| format!("Could not create project: {}", e))
 }
 
 #[cfg(test)]
@@ -46,7 +68,7 @@ mod tests {
         let project = base.join("demo");
         fs::create_dir(&project)?;
 
-        init(&project)?;
+        init(&project, Kind::Bin)?;
         let text = fs::read_to_string(project.join(FILE_NAME))?;
         fs::remove_dir_all(&base)?;
 
@@ -54,6 +76,48 @@ mod tests {
             text,
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lib_scaffold_writes_lib_root_only() -> io::Result<()> {
+        let base = temp_dir("lib")?;
+        let project = base.join("demo");
+        new(&project.to_string_lossy(), Kind::Lib).map_err(io::Error::other)?;
+
+        let lib = fs::read_to_string(project.join("src/lib.nk"))?;
+        let has_main = project.join("src/main.nk").exists();
+        fs::remove_dir_all(&base)?;
+
+        assert!(lib.contains("fn answer"), "{lib}");
+        assert!(!has_main);
+        Ok(())
+    }
+
+    #[test]
+    fn bin_scaffold_writes_main_root_only() -> io::Result<()> {
+        let base = temp_dir("bin")?;
+        let project = base.join("demo");
+        new(&project.to_string_lossy(), Kind::Bin).map_err(io::Error::other)?;
+
+        let main = fs::read_to_string(project.join("src/main.nk"))?;
+        let has_lib = project.join("src/lib.nk").exists();
+        fs::remove_dir_all(&base)?;
+
+        assert!(main.contains("fn main"), "{main}");
+        assert!(!has_lib);
+        Ok(())
+    }
+
+    #[test]
+    fn new_refuses_existing_directory() -> io::Result<()> {
+        let base = temp_dir("exists")?;
+        let project = base.join("demo");
+        fs::create_dir(&project)?;
+
+        let err = new(&project.to_string_lossy(), Kind::Bin).unwrap_err();
+        fs::remove_dir_all(&base)?;
+        assert!(err.contains("already exists"), "{err}");
         Ok(())
     }
 }
