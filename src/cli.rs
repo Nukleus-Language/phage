@@ -60,8 +60,13 @@ pub fn run(args: &[String]) {
                 Some(i) => (&args[2..2 + i], &args[3 + i..]),
                 None => (&args[2..], &args[args.len()..]),
             };
-            let opts = flags(opts, "run").unwrap_or_else(|e| fail(&e));
-            let code = build::run(opts, program_args).unwrap_or_else(|e| fail(&e));
+            let (jit, opts) = run_flags(opts).unwrap_or_else(|e| fail(&e));
+            let result = if jit {
+                build::run_jit(opts, program_args)
+            } else {
+                build::run(opts, program_args)
+            };
+            let code = result.unwrap_or_else(|e| fail(&e));
             process::exit(code);
         }
         "new" => {
@@ -113,6 +118,12 @@ fn flags(args: &[String], command: &str) -> Result<build::Options, String> {
         }
     }
     Ok(flags)
+}
+
+fn run_flags(args: &[String]) -> Result<(bool, build::Options), String> {
+    let jit = args.iter().any(|arg| arg == "--jit");
+    let rest: Vec<String> = args.iter().filter(|arg| *arg != "--jit").cloned().collect();
+    Ok((jit, flags(&rest, "run")?))
 }
 
 fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), String> {
@@ -174,7 +185,7 @@ fn print_help_main() {
         ColoredString::new("test", h3_style)
     );
     println!(
-        "  {}                Build and run the project (args after -- go to the program)",
+        "  {}                Build and run the project (args after -- go to the program; --jit runs it in lamina's JIT instead, x86_64 Linux only, no program args)",
         ColoredString::new("run", h3_style)
     );
     println!(
@@ -262,6 +273,34 @@ mod tests {
         assert_eq!(
             test_flags(&args(&["--filter"])).unwrap_err(),
             "'--filter' needs a value."
+        );
+    }
+
+    #[test]
+    fn run_flags_take_jit_alongside_build_flags() {
+        assert_eq!(
+            run_flags(&args(&["--jit", "--release"])),
+            Ok((
+                true,
+                build::Options {
+                    release: true,
+                    ..Default::default()
+                }
+            ))
+        );
+        assert_eq!(
+            run_flags(&args(&["--locked"])),
+            Ok((
+                false,
+                build::Options {
+                    locked: true,
+                    ..Default::default()
+                }
+            ))
+        );
+        assert_eq!(
+            run_flags(&args(&["--frozen"])).unwrap_err(),
+            "Unknown option '--frozen' for 'run'."
         );
     }
 

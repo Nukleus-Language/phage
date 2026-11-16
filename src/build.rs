@@ -8,9 +8,11 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::{OsStr, OsString},
-    fs, io,
+    fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub struct Options {
 
 struct Target {
     nukleus: OsString,
+    lamina: OsString,
     root: PathBuf,
     manifest: Manifest,
     store: Store,
@@ -44,6 +47,7 @@ fn resolve(offline: bool) -> Result<Target, String> {
     let manifest = manifest::load(&manifest_path)?;
     Ok(Target {
         nukleus: env::var_os("NUKLEUS").unwrap_or_else(|| OsString::from("nukleus")),
+        lamina: env::var_os("LAMINA").unwrap_or_else(|| OsString::from("lamina")),
         root,
         manifest,
         store: Store::from_env(offline)?,
@@ -203,6 +207,139 @@ fn run_with(
     Ok(status.code().unwrap_or(1))
 }
 
+pub fn run_jit(opts: Options, program_args: &[String]) -> Result<i32, String> {
+    if let Some(err) = jit_host_error(env::consts::ARCH, env::consts::OS) {
+        return Err(err);
+    }
+    if let Some(err) = jit_argument_error(program_args) {
+        return Err(err);
+    }
+    let target = resolve(opts.offline)?;
+    sync_lock(&target, opts.locked)?;
+    run_jit_with(
+        &target.nukleus,
+        &target.lamina,
+        &target.root,
+        &target.manifest,
+        &target.store,
+        opts.release,
+    )
+}
+
+fn jit_host_error(arch: &str, os: &str) -> Option<String> {
+    (arch != "x86_64" || os != "linux").then(|| {
+        format!(
+            "'run --jit' runs only on x86_64 Linux for now; this host is {arch} {os}. Use 'phage run' instead"
+        )
+    })
+}
+
+fn jit_argument_error(program_args: &[String]) -> Option<String> {
+    (!program_args.is_empty()).then(|| {
+        "'run --jit' passes no arguments to the program: lamina's JIT calls main without them. Drop the args after '--'".to_string()
+    })
+}
+
+fn run_jit_with(
+    nukleus: &OsStr,
+    lamina: &OsStr,
+    root: &Path,
+    manifest: &Manifest,
+    store: &Store,
+    release: bool,
+) -> Result<i32, String> {
+    let bin = roots(root, manifest)?
+        .bin
+        .ok_or_else(|| format!("no binary root: {} not found", BIN_ROOT))?;
+    let out_dir = root.join("target").join("jit");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+    let graph = deps::collect(root, manifest, store)?;
+    compile(
+        nukleus,
+        &bin,
+        &Output::Jit { out_dir: &out_dir },
+        &graph,
+        &manifest.lints,
+    )?;
+    let ir = out_dir
+        .join(bin.file_stem().unwrap_or_default())
+        .with_extension("lamina");
+    let (program, args) = jit_command(lamina, &ir, release);
+    let mut child = Command::new(&program)
+        .args(&args)
+        .env("LAMINA_JIT_NO_FALLBACK", "1")
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "lamina not found ('{}'): put it on PATH or set LAMINA to its path",
+                    program.to_string_lossy()
+                )
+            } else {
+                format!("Could not run '{}': {}", program.to_string_lossy(), e)
+            }
+        })?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or("Could not read lamina's stderr")?;
+    let relay = thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            kept.extend_from_slice(&buf[..n]);
+            let _ = io::stderr().write_all(&buf[..n]);
+        }
+        kept
+    });
+    let status = child
+        .wait()
+        .map_err(|e| format!("Could not wait for lamina: {}", e))?;
+    let kept = relay.join().unwrap_or_default();
+    let code = status.code().unwrap_or(1);
+    if code == 1 && lamina_refused(&String::from_utf8_lossy(&kept)) {
+        return Err(
+            "lamina could not JIT this program (its reason is above). Use 'phage run' to build it ahead of time instead"
+                .to_string(),
+        );
+    }
+    Ok(code)
+}
+
+const LAMINA_ERRORS: &[&str] = &[
+    "ParsingError",
+    "CodegenError",
+    "MirError",
+    "ValidationError",
+    "IoError",
+    "Utf8Error",
+    "InternalError",
+    "RuntimeError",
+];
+
+/// A JIT run exits with the program's code, so only a lamina that failed returns an error.
+fn lamina_refused(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.strip_prefix("Error: ")
+            .and_then(|rest| rest.split_once('('))
+            .is_some_and(|(name, _)| LAMINA_ERRORS.contains(&name))
+    })
+}
+
+fn jit_command(lamina: &OsStr, ir: &Path, release: bool) -> (OsString, Vec<OsString>) {
+    let mut args = vec![ir.as_os_str().to_os_string(), OsString::from("--jit")];
+    if release {
+        args.push(OsString::from("--opt-level"));
+        args.push(OsString::from("2"));
+    }
+    (lamina.to_os_string(), args)
+}
+
 pub fn check(opts: Options) -> Result<(), String> {
     let target = resolve(opts.offline)?;
     sync_lock(&target, opts.locked)?;
@@ -320,6 +457,9 @@ enum Output<'a> {
     Check {
         out_dir: &'a Path,
     },
+    Jit {
+        out_dir: &'a Path,
+    },
     Test {
         path: &'a Path,
         filter: Option<&'a str>,
@@ -329,7 +469,7 @@ enum Output<'a> {
 impl Output<'_> {
     fn failure(&self) -> &'static str {
         match self {
-            Output::Binary { .. } => "build failed",
+            Output::Binary { .. } | Output::Jit { .. } => "build failed",
             Output::Check { .. } => "check failed",
             Output::Test { .. } => "test build failed",
         }
@@ -354,7 +494,7 @@ fn compile_command(cmd: &CompileCommand) -> (OsString, Vec<OsString>) {
                 args.push(OsString::from("-O2"));
             }
         }
-        Output::Check { out_dir } => {
+        Output::Check { out_dir } | Output::Jit { out_dir } => {
             args.push(OsString::from("--emit"));
             args.push(OsString::from("ir"));
             args.push(OsString::from("--out-dir"));
@@ -447,6 +587,92 @@ mod tests {
                 OsString::from("/p/src/main.nk"),
             ]
         );
+    }
+
+    #[test]
+    fn compile_command_jit_emits_ir_only() {
+        let (program, args) = compile_command(&CompileCommand {
+            nukleus: OsStr::new("nukleus"),
+            input: Path::new("/p/src/main.nk"),
+            output: &Output::Jit {
+                out_dir: Path::new("/p/target/jit"),
+            },
+            graph: &no_graph(),
+            lints: &BTreeMap::new(),
+        });
+        assert_eq!(program, OsString::from("nukleus"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--emit"),
+                OsString::from("ir"),
+                OsString::from("--out-dir"),
+                OsString::from("/p/target/jit"),
+                OsString::from("/p/src/main.nk"),
+            ]
+        );
+    }
+
+    #[test]
+    fn jit_command_debug_leaves_lamina_at_its_default_level() {
+        let (program, args) = jit_command(
+            OsStr::new("lamina"),
+            Path::new("/p/target/jit/main.lamina"),
+            false,
+        );
+        assert_eq!(program, OsString::from("lamina"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/p/target/jit/main.lamina"),
+                OsString::from("--jit"),
+            ]
+        );
+    }
+
+    #[test]
+    fn jit_command_release_asks_lamina_for_level_two() {
+        let (_, args) = jit_command(
+            OsStr::new("lamina"),
+            Path::new("/p/target/jit/main.lamina"),
+            true,
+        );
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/p/target/jit/main.lamina"),
+                OsString::from("--jit"),
+                OsString::from("--opt-level"),
+                OsString::from("2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn jit_runs_only_on_x86_64_linux() {
+        assert_eq!(jit_host_error("x86_64", "linux"), None);
+        let err = jit_host_error("aarch64", "linux").unwrap();
+        assert!(
+            err.contains("x86_64 Linux") && err.contains("aarch64 linux"),
+            "{err}"
+        );
+        assert!(jit_host_error("x86_64", "macos").is_some());
+    }
+
+    #[test]
+    fn jit_refuses_program_arguments() {
+        assert_eq!(jit_argument_error(&[]), None);
+        let err = jit_argument_error(&["x".to_string()]).unwrap();
+        assert!(err.contains("no arguments"), "{err}");
+    }
+
+    #[test]
+    fn lamina_refusal_is_an_error_line_naming_a_lamina_error() {
+        assert!(lamina_refused("Error: ValidationError(\"no\")\n"));
+        assert!(lamina_refused("noise\nError: MirError(\"x\")\n"));
+        assert!(!lamina_refused("Error: program said so\n"));
+        assert!(!lamina_refused("ValidationError(\"no\")\n"));
+        assert!(!lamina_refused(""));
     }
 
     fn no_graph() -> Graph {
@@ -900,6 +1126,103 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let err = check_with(nukleus.as_os_str(), &root, &demo(), &store(&root)).unwrap_err();
             assert_eq!(err, "check failed");
             fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        const FAKE_LAMINA: &str = "#!/bin/sh
+[ \"$2\" = \"--jit\" ] || exit 4
+case \"$1\" in *main.lamina) ;; *) exit 5 ;; esac
+[ \"$LAMINA_JIT_NO_FALLBACK\" = 1 ] || exit 6
+exit 7
+";
+
+        #[test]
+        fn run_jit_builds_ir_and_returns_lamina_exit_code() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("jit")?;
+            let nukleus = root.join("fake-nukleus");
+            let lamina = root.join("fake-lamina");
+            write_exec(&nukleus, FAKE_CHECK)?;
+            write_exec(&lamina, FAKE_LAMINA)?;
+
+            let code = run_jit_with(
+                nukleus.as_os_str(),
+                lamina.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+            )
+            .map_err(io::Error::other)?;
+            assert_eq!(code, 7);
+            assert!(root.join("target/jit/main.lamina").is_file());
+            Ok(())
+        }
+
+        #[test]
+        fn run_jit_reports_refusal_with_suggestion() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("jit_refused")?;
+            let nukleus = root.join("fake-nukleus");
+            let lamina = root.join("fake-lamina");
+            write_exec(&nukleus, FAKE_CHECK)?;
+            write_exec(
+                &lamina,
+                "#!/bin/sh\necho 'Error: ValidationError(\"no calls\")' >&2\nexit 1\n",
+            )?;
+
+            let err = run_jit_with(
+                nukleus.as_os_str(),
+                lamina.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("phage run"), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn run_jit_program_exit_one_is_not_a_refusal() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("jit_exit_one")?;
+            let nukleus = root.join("fake-nukleus");
+            let lamina = root.join("fake-lamina");
+            write_exec(&nukleus, FAKE_CHECK)?;
+            write_exec(&lamina, "#!/bin/sh\necho done >&2\nexit 1\n")?;
+
+            let code = run_jit_with(
+                nukleus.as_os_str(),
+                lamina.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+            )
+            .map_err(io::Error::other)?;
+            assert_eq!(code, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn run_jit_reports_missing_lamina() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("jit_missing")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_CHECK)?;
+            let lamina = root.join("no-such-lamina");
+
+            let err = run_jit_with(
+                nukleus.as_os_str(),
+                lamina.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+            )
+            .unwrap_err();
+            assert!(err.contains("LAMINA"), "{err}");
             Ok(())
         }
     }
