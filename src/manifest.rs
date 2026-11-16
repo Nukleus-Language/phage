@@ -11,7 +11,9 @@ pub const FILE_NAME: &str = "Phage.toml";
 pub struct Manifest {
     pub project: Project,
     #[serde(default)]
-    pub dependencies: BTreeMap<String, toml::Value>,
+    pub dependencies: BTreeMap<String, Dependency>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lints: BTreeMap<String, LintLevel>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -21,6 +23,30 @@ pub struct Project {
     pub version: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dependency {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+    Allow,
+    Warn,
+    Deny,
+}
+
+impl LintLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LintLevel::Allow => "allow",
+            LintLevel::Warn => "warn",
+            LintLevel::Deny => "deny",
+        }
+    }
+}
+
 pub fn template(name: &str) -> Result<String, toml::ser::Error> {
     toml::to_string(&Manifest {
         project: Project {
@@ -28,6 +54,7 @@ pub fn template(name: &str) -> Result<String, toml::ser::Error> {
             version: "0.1.0".to_string(),
         },
         dependencies: BTreeMap::new(),
+        lints: BTreeMap::new(),
     })
 }
 
@@ -97,6 +124,63 @@ mod tests {
         let err = load(&path).unwrap_err();
         assert!(err.contains("missing project.name"), "{err}");
         fs::remove_dir_all(&base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parses_lints_table() -> Result<(), toml::de::Error> {
+        let manifest: Manifest = toml::from_str(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[lints]\nnever_mutated = \"warn\"\nfuture_lint = \"deny\"\nold = \"allow\"\n",
+        )?;
+        assert_eq!(
+            manifest.lints,
+            BTreeMap::from([
+                ("future_lint".to_string(), LintLevel::Deny),
+                ("never_mutated".to_string(), LintLevel::Warn),
+                ("old".to_string(), LintLevel::Allow),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_lint_level() {
+        let err = toml::from_str::<Manifest>(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[lints]\nnever_mutated = \"forbid\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("forbid"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_string_lint_level() {
+        let result = toml::from_str::<Manifest>(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[lints]\nnever_mutated = true\n",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_path_dependency() -> Result<(), toml::de::Error> {
+        let manifest: Manifest = toml::from_str(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { path = \"../json\" }\n",
+        )?;
+        assert_eq!(manifest.dependencies["json"].path, PathBuf::from("../json"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dependency_without_path_source() {
+        let result = toml::from_str::<Manifest>(
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\njson = { git = \"https://example.com/json\" }\n",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn template_omits_empty_lints_table() -> Result<(), toml::ser::Error> {
+        let text = template("demo")?;
+        assert!(!text.contains("[lints]"), "{text}");
         Ok(())
     }
 }
