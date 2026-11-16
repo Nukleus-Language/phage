@@ -185,7 +185,7 @@ fn print_help_main() {
         ColoredString::new("test", h3_style)
     );
     println!(
-        "  {}                Build and run the project (args after -- go to the program; --jit runs it in lamina's JIT instead, x86_64 Linux only, no program args)",
+        "  {}                Build and run the project (args after -- go to the program; --jit runs it in lamina's JIT instead, x86_64 Linux only)",
         ColoredString::new("run", h3_style)
     );
     println!(
