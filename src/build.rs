@@ -70,6 +70,23 @@ fn run_with(
     Ok(status.code().unwrap_or(1))
 }
 
+pub fn check() -> Result<(), String> {
+    let target = resolve()?;
+    check_with(&target.nukleus, &target.root, &target.manifest)
+}
+
+fn check_with(nukleus: &OsStr, root: &Path, manifest: &Manifest) -> Result<(), String> {
+    let out_dir = root.join("target").join("check");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+    compile(
+        nukleus,
+        root,
+        manifest,
+        &Output::Check { out_dir: &out_dir },
+    )
+}
+
 fn build_with(
     nukleus: &OsStr,
     root: &Path,
@@ -81,12 +98,29 @@ fn build_with(
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let out = out_dir.join(&manifest.project.name);
+    compile(
+        nukleus,
+        root,
+        manifest,
+        &Output::Binary {
+            path: &out,
+            release,
+        },
+    )?;
+    Ok(out)
+}
+
+fn compile(
+    nukleus: &OsStr,
+    root: &Path,
+    manifest: &Manifest,
+    output: &Output,
+) -> Result<(), String> {
     let graph = deps::collect(root, manifest)?;
     let (program, args) = compile_command(&CompileCommand {
         nukleus,
         input: &root.join("src/main.nk"),
-        out: &out,
-        release,
+        output,
         graph: &graph,
         lints: &manifest.lints,
     });
@@ -101,24 +135,49 @@ fn build_with(
         }
     })?;
     if !status.success() {
-        return Err("build failed".to_string());
+        return Err(output.failure().to_string());
     }
-    Ok(out)
+    Ok(())
+}
+
+enum Output<'a> {
+    Binary { path: &'a Path, release: bool },
+    Check { out_dir: &'a Path },
+}
+
+impl Output<'_> {
+    fn failure(&self) -> &'static str {
+        match self {
+            Output::Binary { .. } => "build failed",
+            Output::Check { .. } => "check failed",
+        }
+    }
 }
 
 struct CompileCommand<'a> {
     nukleus: &'a OsStr,
     input: &'a Path,
-    out: &'a Path,
-    release: bool,
+    output: &'a Output<'a>,
     graph: &'a Graph,
     lints: &'a BTreeMap<String, LintLevel>,
 }
 
 fn compile_command(cmd: &CompileCommand) -> (OsString, Vec<OsString>) {
-    let mut args = vec![OsString::from("-o"), cmd.out.into()];
-    if cmd.release {
-        args.push(OsString::from("-O2"));
+    let mut args = Vec::new();
+    match cmd.output {
+        Output::Binary { path, release } => {
+            args.push(OsString::from("-o"));
+            args.push(path.into());
+            if *release {
+                args.push(OsString::from("-O2"));
+            }
+        }
+        Output::Check { out_dir } => {
+            args.push(OsString::from("--emit"));
+            args.push(OsString::from("ir"));
+            args.push(OsString::from("--out-dir"));
+            args.push(out_dir.into());
+        }
     }
     for (name, path) in &cmd.graph.deps {
         args.push(OsString::from("--dep"));
@@ -169,11 +228,34 @@ mod tests {
         compile_command(&CompileCommand {
             nukleus: OsStr::new("nukleus"),
             input: Path::new("/p/src/main.nk"),
-            out,
-            release,
+            output: &Output::Binary { path: out, release },
             graph,
             lints,
         })
+    }
+
+    #[test]
+    fn compile_command_check_emits_ir_only() {
+        let (program, args) = compile_command(&CompileCommand {
+            nukleus: OsStr::new("nukleus"),
+            input: Path::new("/p/src/main.nk"),
+            output: &Output::Check {
+                out_dir: Path::new("/p/target/check"),
+            },
+            graph: &no_graph(),
+            lints: &BTreeMap::new(),
+        });
+        assert_eq!(program, OsString::from("nukleus"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--emit"),
+                OsString::from("ir"),
+                OsString::from("--out-dir"),
+                OsString::from("/p/target/check"),
+                OsString::from("/p/src/main.nk"),
+            ]
+        );
     }
 
     fn no_graph() -> Graph {
@@ -390,6 +472,41 @@ chmod +x \"$out\"
 
             let err = build_with(nukleus.as_os_str(), &root, &demo(), false).unwrap_err();
             assert!(err.contains("NUKLEUS"), "{err}");
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+
+        const FAKE_CHECK: &str = "#!/bin/sh
+dir=\"\"
+while [ $# -gt 0 ]; do
+  if [ \"$1\" = \"--out-dir\" ]; then dir=\"$2\"; shift; fi
+  shift
+done
+mkdir -p \"$dir\" && echo ir > \"$dir/main.lamina\"
+";
+
+        #[test]
+        fn check_writes_ir_under_target_check() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("check")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, FAKE_CHECK)?;
+
+            check_with(nukleus.as_os_str(), &root, &demo()).map_err(io::Error::other)?;
+            assert!(root.join("target/check/main.lamina").is_file());
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+
+        #[test]
+        fn check_reports_nukleus_error() -> io::Result<()> {
+            let _guard = lock();
+            let root = project("check_fail")?;
+            let nukleus = root.join("fake-nukleus");
+            write_exec(&nukleus, "#!/bin/sh\nexit 1\n")?;
+
+            let err = check_with(nukleus.as_os_str(), &root, &demo()).unwrap_err();
+            assert_eq!(err, "check failed");
             fs::remove_dir_all(&root)?;
             Ok(())
         }

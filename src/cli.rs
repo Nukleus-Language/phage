@@ -39,6 +39,12 @@ pub fn run(args: &[String]) {
             let release = release_flag(&args[2..], "build").unwrap_or_else(|e| fail(&e));
             build::build(release).unwrap_or_else(|e| fail(&e));
         }
+        "check" => {
+            if let Some(other) = args.get(2) {
+                fail(&format!("Unknown option '{}' for 'check'.", other));
+            }
+            build::check().unwrap_or_else(|e| fail(&e));
+        }
         "run" => {
             let (flags, program_args) = match args[2..].iter().position(|a| a == "--") {
                 Some(i) => (&args[2..2 + i], &args[3 + i..]),
@@ -100,6 +106,10 @@ fn print_help_main() {
     println!(
         "  {}                Create a new project in a new directory",
         ColoredString::new("new", h3_style)
+    );
+    println!(
+        "  {}              Type-check the project without linking",
+        ColoredString::new("check", h3_style)
     );
     println!(
         "  {}              Build the project (--release for an optimized build)",
