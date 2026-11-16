@@ -1,5 +1,6 @@
 use crate::{
     deps::{self, Gene, Graph},
+    lock,
     manifest::{self, FILE_NAME, LintLevel, Manifest, find_manifest},
 };
 use std::{
@@ -63,8 +64,14 @@ fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
     Ok(roots)
 }
 
-pub fn build(release: bool) -> Result<(), String> {
+fn sync_lock(target: &Target, locked: bool) -> Result<(), String> {
+    let graph = deps::collect(&target.root, &target.manifest)?;
+    lock::sync(&target.root, &graph, locked)
+}
+
+pub fn build(release: bool, locked: bool) -> Result<(), String> {
     let target = resolve()?;
+    sync_lock(&target, locked)?;
     if let Some(note) = build_roots(&target.nukleus, &target.root, &target.manifest, release)? {
         println!("{}", note);
     }
@@ -93,8 +100,9 @@ fn build_roots(
     }))
 }
 
-pub fn run(release: bool, program_args: &[String]) -> Result<i32, String> {
+pub fn run(release: bool, locked: bool, program_args: &[String]) -> Result<i32, String> {
     let target = resolve()?;
+    sync_lock(&target, locked)?;
     run_with(
         &target.nukleus,
         &target.root,
@@ -119,8 +127,9 @@ fn run_with(
     Ok(status.code().unwrap_or(1))
 }
 
-pub fn check() -> Result<(), String> {
+pub fn check(locked: bool) -> Result<(), String> {
     let target = resolve()?;
+    sync_lock(&target, locked)?;
     check_with(&target.nukleus, &target.root, &target.manifest)
 }
 
