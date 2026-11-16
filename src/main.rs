@@ -1,6 +1,7 @@
 mod build;
 mod cli;
 mod deps;
+mod lock;
 mod manifest;
 mod project;
 #[cfg(test)]
