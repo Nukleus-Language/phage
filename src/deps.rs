@@ -1,22 +1,36 @@
-use crate::manifest::{self, FILE_NAME, Manifest};
+use crate::manifest::{self, FILE_NAME, LintLevel, Manifest};
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
-pub fn collect(root: &Path, manifest: &Manifest) -> Result<Vec<(String, PathBuf)>, String> {
+#[derive(Debug)]
+pub struct Graph {
+    pub deps: Vec<(String, PathBuf)>,
+    pub genes: Vec<Gene>,
+}
+
+#[derive(Debug)]
+pub struct Gene {
+    pub name: String,
+    pub root: PathBuf,
+    pub deps: Vec<(String, PathBuf)>,
+    pub lints: BTreeMap<String, LintLevel>,
+    pub(crate) dir: PathBuf,
+}
+
+pub fn collect(root: &Path, manifest: &Manifest) -> Result<Graph, String> {
     let root = fs::canonicalize(root)
         .map_err(|e| format!("Could not resolve '{}': {}", root.display(), e))?;
     let mut walk = Walk::default();
     walk.stack
         .push((manifest.project.name.clone(), root.clone()));
-    walk.visit(manifest, &root)?;
-    Ok(walk
-        .genes
-        .into_iter()
-        .map(|(name, gene)| (name, gene.root))
-        .collect())
+    let deps = walk.visit(manifest, &root)?;
+    Ok(Graph {
+        deps,
+        genes: walk.genes.into_values().collect(),
+    })
 }
 
 #[derive(Default)]
@@ -26,13 +40,9 @@ struct Walk {
     stack: Vec<(String, PathBuf)>,
 }
 
-struct Gene {
-    dir: PathBuf,
-    root: PathBuf,
-}
-
 impl Walk {
-    fn visit(&mut self, manifest: &Manifest, dir: &Path) -> Result<(), String> {
+    fn visit(&mut self, manifest: &Manifest, dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+        let mut declared = Vec::new();
         for (name, dep) in &manifest.dependencies {
             let candidate = dir.join(&dep.path);
             let canon = fs::canonicalize(&candidate).map_err(|e| {
@@ -62,6 +72,7 @@ impl Walk {
                         name
                     ));
                 }
+                declared.push((name.clone(), self.genes[name].root.clone()));
                 continue;
             }
 
@@ -84,20 +95,28 @@ impl Walk {
                 ));
             }
             let dep_manifest = manifest::load(&manifest_path)?;
+            let root = canon.join(dep_manifest.lib_path());
 
             self.packages.insert(canon.clone(), name.clone());
             self.genes.insert(
                 name.clone(),
                 Gene {
-                    root: canon.join(dep_manifest.lib_path()),
+                    name: name.clone(),
+                    root: root.clone(),
+                    deps: Vec::new(),
+                    lints: dep_manifest.lints.clone(),
                     dir: canon.clone(),
                 },
             );
             self.stack.push((name.clone(), canon.clone()));
-            self.visit(&dep_manifest, &canon)?;
+            let deps = self.visit(&dep_manifest, &canon)?;
             self.stack.pop();
+            if let Some(gene) = self.genes.get_mut(name) {
+                gene.deps = deps;
+            }
+            declared.push((name.clone(), root));
         }
-        Ok(())
+        Ok(declared)
     }
 }
 
@@ -131,8 +150,8 @@ mod tests {
         manifest::load(&dir.join(FILE_NAME)).map_err(io::Error::other)
     }
 
-    fn names(genes: &[(String, PathBuf)]) -> Vec<&str> {
-        genes.iter().map(|(name, _)| name.as_str()).collect()
+    fn names(genes: &[Gene]) -> Vec<&str> {
+        genes.iter().map(|gene| gene.name.as_str()).collect()
     }
 
     #[test]
@@ -142,9 +161,9 @@ mod tests {
         let dep = package(&base, "dep", &[], Some("src/x.nk"))?;
         let expected = fs::canonicalize(&dep)?.join("src/x.nk");
 
-        let genes = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
-        assert_eq!(genes, vec![("dep".to_string(), expected)]);
+        assert_eq!(graph.deps, vec![("dep".to_string(), expected)]);
         Ok(())
     }
 
@@ -156,10 +175,15 @@ mod tests {
         package(&base, "b", &[("c", "../c")], None)?;
         package(&base, "c", &[], None)?;
 
-        let genes = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
-        assert_eq!(names(&genes), ["a", "b", "c"]);
-        assert!(genes.iter().all(|(_, path)| path.ends_with("src/lib.nk")));
+        assert_eq!(names(&graph.genes), ["a", "b", "c"]);
+        assert!(
+            graph
+                .genes
+                .iter()
+                .all(|gene| gene.root.ends_with("src/lib.nk"))
+        );
         Ok(())
     }
 
@@ -172,9 +196,49 @@ mod tests {
         package(&base, "c", &[("d", "../d")], None)?;
         package(&base, "d", &[], None)?;
 
-        let genes = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
         fs::remove_dir_all(&base)?;
-        assert_eq!(names(&genes), ["a", "b", "c", "d"]);
+        assert_eq!(names(&graph.genes), ["a", "b", "c", "d"]);
+        Ok(())
+    }
+
+    #[test]
+    fn each_gene_records_only_its_own_deps_and_lints() -> io::Result<()> {
+        let base = temp_dir("per_gene")?;
+        let root = package(&base, "root", &[("a", "../a")], None)?;
+        let a = package(&base, "a", &[("b", "../b"), ("c", "../c")], None)?;
+        fs::write(
+            a.join(FILE_NAME),
+            "[project]\nname = \"a\"\nversion = \"0.1.0\"\n\n[lints]\nnever_mutated = \"deny\"\n\n[dependencies]\nb = { path = \"../b\" }\nc = { path = \"../c\" }\n",
+        )?;
+        package(&base, "b", &[], None)?;
+        package(&base, "c", &[("b", "../b")], None)?;
+        let a_root = fs::canonicalize(&a)?.join("src/lib.nk");
+        let b_root = fs::canonicalize(base.join("b"))?.join("src/lib.nk");
+        let c_root = fs::canonicalize(base.join("c"))?.join("src/lib.nk");
+
+        let graph = collect(&root, &load_root(&root)?).map_err(io::Error::other)?;
+        fs::remove_dir_all(&base)?;
+        assert_eq!(graph.deps, vec![("a".to_string(), a_root)]);
+        let [gene_a, gene_b, gene_c] = graph.genes.as_slice() else {
+            panic!("three genes");
+        };
+        assert_eq!(gene_a.name, "a");
+        assert_eq!(
+            gene_a.deps,
+            vec![
+                ("b".to_string(), b_root.clone()),
+                ("c".to_string(), c_root.clone())
+            ]
+        );
+        assert_eq!(
+            gene_a.lints,
+            BTreeMap::from([("never_mutated".to_string(), LintLevel::Deny)])
+        );
+        assert_eq!(gene_b.name, "b");
+        assert!(gene_b.deps.is_empty() && gene_b.lints.is_empty());
+        assert_eq!(gene_c.deps, vec![("b".to_string(), b_root)]);
+        assert!(gene_c.lints.is_empty());
         Ok(())
     }
 

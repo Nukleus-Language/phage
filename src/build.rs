@@ -1,5 +1,5 @@
 use crate::{
-    deps,
+    deps::{self, Gene, Graph},
     manifest::{self, FILE_NAME, LintLevel, Manifest, find_manifest},
 };
 use std::{
@@ -81,13 +81,13 @@ fn build_with(
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let out = out_dir.join(&manifest.project.name);
-    let genes = deps::collect(root, manifest)?;
+    let graph = deps::collect(root, manifest)?;
     let (program, args) = compile_command(&CompileCommand {
         nukleus,
         input: &root.join("src/main.nk"),
         out: &out,
         release,
-        deps: &genes,
+        graph: &graph,
         lints: &manifest.lints,
     });
     let status = Command::new(&program).args(&args).status().map_err(|e| {
@@ -111,7 +111,7 @@ struct CompileCommand<'a> {
     input: &'a Path,
     out: &'a Path,
     release: bool,
-    deps: &'a [(String, PathBuf)],
+    graph: &'a Graph,
     lints: &'a BTreeMap<String, LintLevel>,
 }
 
@@ -120,7 +120,7 @@ fn compile_command(cmd: &CompileCommand) -> (OsString, Vec<OsString>) {
     if cmd.release {
         args.push(OsString::from("-O2"));
     }
-    for (name, path) in cmd.deps {
+    for (name, path) in &cmd.graph.deps {
         args.push(OsString::from("--dep"));
         args.push(pair(name, path.as_os_str()));
     }
@@ -128,8 +128,25 @@ fn compile_command(cmd: &CompileCommand) -> (OsString, Vec<OsString>) {
         args.push(OsString::from("--lint"));
         args.push(pair(name, OsStr::new(level.as_str())));
     }
+    for gene in &cmd.graph.genes {
+        gene_args(&mut args, gene);
+    }
     args.push(cmd.input.into());
     (cmd.nukleus.to_os_string(), args)
+}
+
+fn gene_args(args: &mut Vec<OsString>, gene: &Gene) {
+    for (name, path) in &gene.deps {
+        args.push(OsString::from("--gene-dep"));
+        args.push(pair(&format!("{}:{}", gene.name, name), path.as_os_str()));
+    }
+    for (name, level) in &gene.lints {
+        args.push(OsString::from("--gene-lint"));
+        args.push(pair(
+            &format!("{}:{}", gene.name, name),
+            OsStr::new(level.as_str()),
+        ));
+    }
 }
 
 fn pair(name: &str, value: &OsStr) -> OsString {
@@ -146,7 +163,7 @@ mod tests {
     fn command<'a>(
         out: &'a Path,
         release: bool,
-        deps: &'a [(String, PathBuf)],
+        graph: &'a Graph,
         lints: &'a BTreeMap<String, LintLevel>,
     ) -> (OsString, Vec<OsString>) {
         compile_command(&CompileCommand {
@@ -154,9 +171,16 @@ mod tests {
             input: Path::new("/p/src/main.nk"),
             out,
             release,
-            deps,
+            graph,
             lints,
         })
+    }
+
+    fn no_graph() -> Graph {
+        Graph {
+            deps: Vec::new(),
+            genes: Vec::new(),
+        }
     }
 
     #[test]
@@ -164,7 +188,7 @@ mod tests {
         let (program, args) = command(
             Path::new("/p/target/debug/demo"),
             false,
-            &[],
+            &no_graph(),
             &BTreeMap::new(),
         );
         assert_eq!(program, OsString::from("nukleus"));
@@ -183,7 +207,7 @@ mod tests {
         let (_, args) = command(
             Path::new("/p/target/release/demo"),
             true,
-            &[],
+            &no_graph(),
             &BTreeMap::new(),
         );
         assert_eq!(
@@ -199,12 +223,15 @@ mod tests {
 
     #[test]
     fn compile_command_passes_dependencies_and_lints() {
-        let deps = [("json".to_string(), PathBuf::from("/p/json/src/lib.nk"))];
+        let graph = Graph {
+            deps: vec![("json".to_string(), PathBuf::from("/p/json/src/lib.nk"))],
+            genes: Vec::new(),
+        };
         let lints = BTreeMap::from([
             ("never_mutated".to_string(), LintLevel::Warn),
             ("future_lint".to_string(), LintLevel::Deny),
         ]);
-        let (_, args) = command(Path::new("/p/target/debug/demo"), false, &deps, &lints);
+        let (_, args) = command(Path::new("/p/target/debug/demo"), false, &graph, &lints);
         assert_eq!(
             args,
             vec![
@@ -216,6 +243,52 @@ mod tests {
                 OsString::from("future_lint=deny"),
                 OsString::from("--lint"),
                 OsString::from("never_mutated=warn"),
+                OsString::from("/p/src/main.nk"),
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_command_passes_each_genes_deps_and_lints() {
+        let graph = Graph {
+            deps: vec![("a".to_string(), PathBuf::from("/p/a/src/lib.nk"))],
+            genes: vec![
+                Gene {
+                    name: "a".to_string(),
+                    root: PathBuf::from("/p/a/src/lib.nk"),
+                    deps: vec![("b".to_string(), PathBuf::from("/p/b/src/lib.nk"))],
+                    lints: BTreeMap::from([("never_mutated".to_string(), LintLevel::Deny)]),
+                    dir: PathBuf::from("/p/a"),
+                },
+                Gene {
+                    name: "b".to_string(),
+                    root: PathBuf::from("/p/b/src/lib.nk"),
+                    deps: Vec::new(),
+                    lints: BTreeMap::new(),
+                    dir: PathBuf::from("/p/b"),
+                },
+            ],
+        };
+        let root_lints = BTreeMap::from([("never_mutated".to_string(), LintLevel::Warn)]);
+        let (_, args) = command(
+            Path::new("/p/target/debug/demo"),
+            false,
+            &graph,
+            &root_lints,
+        );
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-o"),
+                OsString::from("/p/target/debug/demo"),
+                OsString::from("--dep"),
+                OsString::from("a=/p/a/src/lib.nk"),
+                OsString::from("--lint"),
+                OsString::from("never_mutated=warn"),
+                OsString::from("--gene-dep"),
+                OsString::from("a:b=/p/b/src/lib.nk"),
+                OsString::from("--gene-lint"),
+                OsString::from("a:never_mutated=deny"),
                 OsString::from("/p/src/main.nk"),
             ]
         );
