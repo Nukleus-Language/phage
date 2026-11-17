@@ -10,6 +10,11 @@ pub struct Command {
 const LOCKED_OFFLINE: &[(&str, &str)] = &[
     ("--locked", "Fail if Phage.lock would change"),
     ("--offline", "Use only the git cache, never the network"),
+    ("-p <name>", "Only this workspace package (repeatable)"),
+    (
+        "--profile <name>",
+        "Use this profile (dev, release, or one from Phage.toml)",
+    ),
 ];
 
 pub const COMMANDS: &[Command] = &[
@@ -45,6 +50,11 @@ pub const COMMANDS: &[Command] = &[
             ("--release", "Build with optimizations"),
             ("--locked", "Fail if Phage.lock would change"),
             ("--offline", "Use only the git cache, never the network"),
+            ("-p <name>", "Only this workspace package (repeatable)"),
+            (
+                "--profile <name>",
+                "Use this profile (dev, release, or one from Phage.toml)",
+            ),
         ],
     },
     Command {
@@ -58,6 +68,11 @@ pub const COMMANDS: &[Command] = &[
             ),
             ("--locked", "Fail if Phage.lock would change"),
             ("--offline", "Use only the git cache, never the network"),
+            ("-p <name>", "Only this workspace package (repeatable)"),
+            (
+                "--profile <name>",
+                "Use this profile (dev, release, or one from Phage.toml)",
+            ),
         ],
     },
     Command {
@@ -69,6 +84,11 @@ pub const COMMANDS: &[Command] = &[
             ("--jit", "Run in lamina's JIT instead (x86_64 Linux only)"),
             ("--locked", "Fail if Phage.lock would change"),
             ("--offline", "Use only the git cache, never the network"),
+            ("-p <name>", "Only this workspace package (repeatable)"),
+            (
+                "--profile <name>",
+                "Use this profile (dev, release, or one from Phage.toml)",
+            ),
             ("-- <args>", "Pass the remaining arguments to the program"),
         ],
     },

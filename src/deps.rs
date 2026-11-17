@@ -41,8 +41,7 @@ pub fn collect(root: &Path, manifest: &Manifest, store: &Store) -> Result<Graph,
         packages: BTreeMap::new(),
         stack: Vec::new(),
     };
-    walk.stack
-        .push((manifest.project.name.clone(), root.clone()));
+    walk.stack.push((manifest.name().to_string(), root.clone()));
     let deps = walk.visit(manifest, &root)?;
     Ok(Graph {
         deps,
@@ -114,7 +113,7 @@ impl Walk<'_> {
                 name.clone(),
                 Gene {
                     name: name.clone(),
-                    version: dep_manifest.project.version.clone(),
+                    version: dep_manifest.version().to_string(),
                     root: root.clone(),
                     deps: Vec::new(),
                     lints: dep_manifest.lints.clone(),

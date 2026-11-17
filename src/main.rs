@@ -7,10 +7,12 @@ mod git;
 mod help;
 mod lock;
 mod manifest;
+mod profile;
 mod project;
 #[cfg(test)]
 mod testutil;
 mod ui;
+mod workspace;
 
 use std::env;
 

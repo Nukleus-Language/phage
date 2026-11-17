@@ -11,13 +11,18 @@ const DEFAULT_LIB: &str = "src/lib.nk";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Manifest {
-    pub project: Project,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Workspace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lib: Option<Lib>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lints: BTreeMap<String, LintLevel>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profile: BTreeMap<String, ProfileDef>,
 }
 
 impl Manifest {
@@ -26,6 +31,32 @@ impl Manifest {
             .as_ref()
             .map_or(Path::new(DEFAULT_LIB), |lib| lib.path.as_path())
     }
+
+    pub fn name(&self) -> &str {
+        self.project.as_ref().map_or("", |project| &project.name)
+    }
+
+    pub fn version(&self) -> &str {
+        self.project.as_ref().map_or("", |project| &project.version)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workspace {
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileDef {
+    #[serde(default, rename = "opt-level", skip_serializing_if = "Option::is_none")]
+    pub opt_level: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherits: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lints: BTreeMap<String, LintLevel>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -89,13 +120,15 @@ impl LintLevel {
 
 pub fn template(name: &str) -> Result<String, toml::ser::Error> {
     toml::to_string(&Manifest {
-        project: Project {
+        project: Some(Project {
             name: name.to_string(),
             version: "0.1.0".to_string(),
-        },
+        }),
+        workspace: None,
         lib: None,
         dependencies: BTreeMap::new(),
         lints: BTreeMap::new(),
+        profile: BTreeMap::new(),
     })
 }
 
@@ -111,11 +144,29 @@ pub fn load(path: &Path) -> Result<Manifest, Error> {
         .map_err(|e| Error::from(format!("Could not read '{}': {}", path.display(), e)))?;
     let manifest: Manifest = toml::from_str(&text)
         .map_err(|e| Error::from(format!("Could not parse '{}': {}", path.display(), e)))?;
-    if manifest.project.name.is_empty() {
-        return Err(Error::from(format!(
-            "'{}' is missing project.name",
-            path.display()
-        )));
+    match &manifest.project {
+        Some(project) if project.name.is_empty() => {
+            return Err(Error::from(format!(
+                "'{}' is missing project.name",
+                path.display()
+            )));
+        }
+        None if manifest.workspace.is_none() => {
+            return Err(Error::from(format!(
+                "'{}' has neither [project] nor [workspace]",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
+    for (name, def) in &manifest.profile {
+        if def.opt_level.is_some_and(|level| level > 3) {
+            return Err(Error::from(format!(
+                "'{}': profile '{}' opt-level must be 0 to 3",
+                path.display(),
+                name
+            )));
+        }
     }
     Ok(manifest)
 }
@@ -142,8 +193,8 @@ mod tests {
         let name = r#"we"ird\name"#;
         let text = template(name)?;
         let manifest: Manifest = toml::from_str(&text)?;
-        assert_eq!(manifest.project.name, name);
-        assert_eq!(manifest.project.version, "0.1.0");
+        assert_eq!(manifest.name(), name);
+        assert_eq!(manifest.version(), "0.1.0");
         Ok(())
     }
 
@@ -260,6 +311,36 @@ mod tests {
             "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[lib]\npath = \"src/x.nk\"\n",
         )?;
         assert_eq!(manifest.lib_path(), Path::new("src/x.nk"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_only_manifest_loads_without_project() -> std::io::Result<()> {
+        let base = temp_dir("ws_only_manifest")?;
+        let path = base.join(FILE_NAME);
+        fs::write(&path, "[workspace]\nmembers = [\"a\"]\n")?;
+        let loaded = load(&path).map_err(std::io::Error::other);
+        fs::remove_dir_all(&base)?;
+        let manifest = loaded?;
+        assert!(manifest.project.is_none());
+        assert_eq!(
+            manifest.workspace.map(|w| w.members),
+            Some(vec!["a".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_rejects_opt_level_above_three() -> std::io::Result<()> {
+        let base = temp_dir("opt_level")?;
+        let path = base.join(FILE_NAME);
+        fs::write(
+            &path,
+            "[project]\nname = \"x\"\nversion = \"0.1.0\"\n\n[profile.dev]\nopt-level = 4\n",
+        )?;
+        let err = load(&path).unwrap_err();
+        fs::remove_dir_all(&base)?;
+        assert!(err.contains("opt-level must be 0 to 3"), "{err}");
         Ok(())
     }
 

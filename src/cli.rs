@@ -237,13 +237,22 @@ fn scaffold_args<'a>(
     Ok((name, kind))
 }
 
+fn value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, Error> {
+    iter.next()
+        .cloned()
+        .ok_or_else(|| Error::from(format!("'{}' needs a value.", flag)))
+}
+
 fn flags(args: &[String], command: &str) -> Result<build::Options, Error> {
     let mut flags = build::Options::default();
-    for arg in args {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--release" => flags.release = true,
             "--locked" => flags.locked = true,
             "--offline" => flags.offline = true,
+            "--profile" => flags.profile = Some(value(&mut iter, "--profile")?),
+            "-p" | "--package" => flags.packages.push(value(&mut iter, arg)?),
             other => {
                 return Err(Error::from(format!(
                     "Unknown option '{}' for '{}'.",
@@ -269,12 +278,9 @@ fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), Error
         match arg.as_str() {
             "--locked" => opts.locked = true,
             "--offline" => opts.offline = true,
-            "--filter" => {
-                let value = rest
-                    .next()
-                    .ok_or_else(|| "'--filter' needs a value.".to_string())?;
-                filter = Some(value.clone());
-            }
+            "--profile" => opts.profile = Some(value(&mut rest, "--profile")?),
+            "-p" | "--package" => opts.packages.push(value(&mut rest, arg)?),
+            "--filter" => filter = Some(value(&mut rest, "--filter")?),
             other => {
                 return Err(Error::from(format!(
                     "Unknown option '{}' for 'test'.",
@@ -321,6 +327,21 @@ mod tests {
     }
 
     #[test]
+    fn flags_take_profile_and_repeated_packages() {
+        let parsed = flags(
+            &args(&["--profile", "fast", "-p", "a", "--package", "b"]),
+            "build",
+        )
+        .unwrap();
+        assert_eq!(parsed.profile.as_deref(), Some("fast"));
+        assert_eq!(parsed.packages, ["a", "b"]);
+        assert_eq!(
+            flags(&args(&["-p"]), "build").unwrap_err(),
+            "'-p' needs a value."
+        );
+    }
+
+    #[test]
     fn flags_accept_offline() {
         assert_eq!(
             flags(&args(&["--offline"]), "run"),
@@ -339,6 +360,7 @@ mod tests {
                 release: true,
                 locked: true,
                 offline: false,
+                ..Default::default()
             })
         );
     }

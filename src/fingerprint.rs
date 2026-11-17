@@ -6,11 +6,13 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     env,
     ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::UNIX_EPOCH,
 };
 
@@ -68,11 +70,17 @@ impl Stamp {
     }
 }
 
-/// Hash of every input nukleus sees for one invocation: the nukleus binary, the root's
-/// sources, and every gene's name, version, source and sources.
-pub fn sources(nukleus: &OsStr, root: &Path, graph: &Graph) -> Result<String, Error> {
+/// Hash of every input nukleus sees for one invocation: the nukleus binary, the profile, the
+/// package's sources, and every gene's name, version, source and sources.
+pub fn sources(
+    nukleus: &OsStr,
+    root: &Path,
+    graph: &Graph,
+    profile: &str,
+) -> Result<String, Error> {
     let mut hasher = Sha256::new();
     feed(&mut hasher, "nukleus", nukleus_identity(nukleus).as_bytes());
+    feed(&mut hasher, "profile", profile.as_bytes());
     feed(&mut hasher, "root", lock::digest(root)?.as_bytes());
     for gene in &graph.genes {
         let line = format!("{} {} {}", gene.name, gene.version, source_text(gene));
@@ -102,13 +110,7 @@ fn nukleus_identity(nukleus: &OsStr) -> String {
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |time| time.as_nanos());
-    let version = Command::new(&path)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_default();
+    let version = nukleus_version(&path);
     format!(
         "{}\n{}\n{}\n{}",
         path.display(),
@@ -116,6 +118,24 @@ fn nukleus_identity(nukleus: &OsStr) -> String {
         modified,
         version
     )
+}
+
+/// `nukleus --version` runs once per program path for the life of the process.
+fn nukleus_version(path: &Path) -> String {
+    static CACHE: Mutex<BTreeMap<PathBuf, String>> = Mutex::new(BTreeMap::new());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(version) = cache.get(path) {
+        return version.clone();
+    }
+    let version = Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    cache.insert(path.to_path_buf(), version.clone());
+    version
 }
 
 fn find_program(program: &OsStr) -> Option<PathBuf> {
@@ -211,11 +231,13 @@ mod tests {
             nukleus.as_os_str(),
             &root,
             &graph(vec![gene(&base, "a", "x")?]),
+            "dev",
         );
         let after = sources(
             nukleus.as_os_str(),
             &root,
             &graph(vec![gene(&base, "a", "y")?]),
+            "dev",
         );
         fs::remove_dir_all(&base)?;
         assert_ne!(
@@ -232,9 +254,9 @@ mod tests {
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join("src/main.nk"), "x")?;
         let nukleus = Path::new("/no/such/nukleus");
-        let first = sources(nukleus.as_os_str(), &root, &graph(Vec::new()));
+        let first = sources(nukleus.as_os_str(), &root, &graph(Vec::new()), "dev");
         fs::write(root.join("src/main.nk"), "y")?;
-        let second = sources(nukleus.as_os_str(), &root, &graph(Vec::new()));
+        let second = sources(nukleus.as_os_str(), &root, &graph(Vec::new()), "dev");
         fs::remove_dir_all(&base)?;
         assert_ne!(
             first.map_err(io::Error::other)?,
@@ -251,13 +273,13 @@ mod tests {
         fs::write(root.join("src/main.nk"), "")?;
         let binary = base.join("fake-nukleus");
         fs::write(&binary, "not a program")?;
-        let before = sources(binary.as_os_str(), &root, &graph(Vec::new()));
+        let before = sources(binary.as_os_str(), &root, &graph(Vec::new()), "dev");
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
         fs::OpenOptions::new()
             .write(true)
             .open(&binary)?
             .set_modified(later)?;
-        let after = sources(binary.as_os_str(), &root, &graph(Vec::new()));
+        let after = sources(binary.as_os_str(), &root, &graph(Vec::new()), "dev");
         fs::remove_dir_all(&base)?;
         assert_ne!(
             before.map_err(io::Error::other)?,
