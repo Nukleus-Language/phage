@@ -37,6 +37,33 @@ pub const COMMANDS: &[Command] = &[
         options: LOCKED_OFFLINE,
     },
     Command {
+        name: "package",
+        usage: "package [-p <name>]",
+        summary: "Build target/package/<name>-<version>.tar.gz and print its index line",
+        options: &[("-p <name>", "Package this workspace member")],
+    },
+    Command {
+        name: "publish",
+        usage: "publish [-p <name>]",
+        summary: "Package and print the steps to publish to the index (pushes nothing)",
+        options: &[("-p <name>", "Publish this workspace member")],
+    },
+    Command {
+        name: "search",
+        usage: "search <text> [--offline]",
+        summary: "Search the index names list",
+        options: &[("--offline", "Use only the cached index")],
+    },
+    Command {
+        name: "index",
+        usage: "index check [dir] [--no-download]",
+        summary: "Check a local index checkout (layout, versions, deps, checksums)",
+        options: &[(
+            "--no-download",
+            "Skip downloading tarballs to compare checksums",
+        )],
+    },
+    Command {
         name: "clean",
         usage: "clean",
         summary: "Remove the target directory of the project",

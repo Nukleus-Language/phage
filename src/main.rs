@@ -7,8 +7,10 @@ mod git;
 mod help;
 mod lock;
 mod manifest;
+mod package;
 mod profile;
 mod project;
+mod registry;
 #[cfg(test)]
 mod testutil;
 mod ui;

@@ -1,8 +1,9 @@
 use crate::error::Error;
 use crate::{
     git::Store,
-    manifest::{self, Dependency, FILE_NAME, LintLevel, Manifest},
+    manifest::{self, Dependency, FILE_NAME, GitDependency, LintLevel, Manifest},
 };
+use semver::{Version, VersionReq};
 use std::{
     collections::BTreeMap,
     fs,
@@ -29,7 +30,15 @@ pub struct Gene {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Path,
-    Git { url: String, sha: String },
+    Git {
+        url: String,
+        sha: String,
+    },
+    Registry {
+        index: String,
+        version: String,
+        checksum: String,
+    },
 }
 
 pub fn collect(root: &Path, manifest: &Manifest, store: &Store) -> Result<Graph, Error> {
@@ -40,6 +49,7 @@ pub fn collect(root: &Path, manifest: &Manifest, store: &Store) -> Result<Graph,
         genes: BTreeMap::new(),
         packages: BTreeMap::new(),
         stack: Vec::new(),
+        chosen: BTreeMap::new(),
     };
     walk.stack.push((manifest.name().to_string(), root.clone()));
     let deps = walk.visit(manifest, &root)?;
@@ -54,6 +64,7 @@ struct Walk<'a> {
     genes: BTreeMap<String, Gene>,
     packages: BTreeMap<PathBuf, String>,
     stack: Vec<(String, PathBuf)>,
+    chosen: BTreeMap<String, (Version, PathBuf, Source)>,
 }
 
 impl Walk<'_> {
@@ -132,7 +143,12 @@ impl Walk<'_> {
         Ok(declared)
     }
 
-    fn locate(&self, name: &str, dep: &Dependency, dir: &Path) -> Result<(PathBuf, Source), Error> {
+    fn locate(
+        &mut self,
+        name: &str,
+        dep: &Dependency,
+        dir: &Path,
+    ) -> Result<(PathBuf, Source), Error> {
         match dep {
             Dependency::Path(path) => {
                 let candidate = dir.join(&path.path);
@@ -146,20 +162,94 @@ impl Walk<'_> {
                 })?;
                 Ok((canon, Source::Path))
             }
-            Dependency::Git(git) => {
-                let checkout = self.store.checkout(name, git)?;
-                let canon = fs::canonicalize(&checkout.dir).map_err(|e| {
-                    format!("Could not resolve '{}': {}", checkout.dir.display(), e)
+            Dependency::Git(git) => self.locate_git(name, git),
+            Dependency::Gene(gene) => {
+                let (owner, repo) = gene.gene.split_once('/').ok_or_else(|| {
+                    Error::with_help(
+                        format!(
+                            "'{}' has gene = \"{}\", which is not owner/name",
+                            name, gene.gene
+                        ),
+                        "write gene = \"owner/name\"",
+                    )
                 })?;
-                Ok((
-                    canon,
-                    Source::Git {
-                        url: git.git.clone(),
-                        sha: checkout.sha,
-                    },
-                ))
+                if owner.is_empty()
+                    || repo.is_empty()
+                    || repo.contains('/')
+                    || !owner
+                        .chars()
+                        .chain(repo.chars())
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                {
+                    return Err(Error::from(format!(
+                        "'{}' has gene = \"{}\", which is not owner/name",
+                        name, gene.gene
+                    )));
+                }
+                if gene.rev.is_some() && gene.tag.is_some() {
+                    return Err(Error::from(format!(
+                        "Dependency '{}' sets both rev and tag.",
+                        name
+                    )));
+                }
+                let git = GitDependency {
+                    git: format!("https://github.com/{}/{}", owner, repo),
+                    rev: gene.rev.clone().or_else(|| gene.tag.clone()),
+                    branch: gene.branch.clone(),
+                };
+                self.locate_git(name, &git)
             }
+            Dependency::Req(text) => self.locate_registry(name, text),
         }
+    }
+
+    fn locate_git(&self, name: &str, git: &GitDependency) -> Result<(PathBuf, Source), Error> {
+        let checkout = self.store.checkout(name, git)?;
+        let canon = fs::canonicalize(&checkout.dir)
+            .map_err(|e| format!("Could not resolve '{}': {}", checkout.dir.display(), e))?;
+        Ok((
+            canon,
+            Source::Git {
+                url: git.git.clone(),
+                sha: checkout.sha,
+            },
+        ))
+    }
+
+    /// One version per name: the first requirement picks the highest match; later ones must accept it.
+    fn locate_registry(&mut self, name: &str, text: &str) -> Result<(PathBuf, Source), Error> {
+        let req = VersionReq::parse(text).map_err(|e| {
+            Error::with_help(
+                format!("bad version requirement '{}' for '{}'", text, name),
+                e.to_string(),
+            )
+        })?;
+        if let Some((version, dir, source)) = self.chosen.get(name) {
+            if !req.matches(version) {
+                return Err(Error::with_help(
+                    format!(
+                        "'{}' is required as {} but {} was already chosen",
+                        name, req, version
+                    ),
+                    "use one requirement per gene, or requirements that overlap",
+                ));
+            }
+            return Ok((dir.clone(), source.clone()));
+        }
+        let pick = self.store.registry.pick(name, &req)?;
+        let dir = self.store.registry.install(&pick)?;
+        let canon = fs::canonicalize(&dir)
+            .map_err(|e| format!("Could not resolve '{}': {}", dir.display(), e))?;
+        let version = Version::parse(&pick.version)
+            .map_err(|e| format!("bad version '{}' for '{}': {}", pick.version, name, e))?;
+        let source = Source::Registry {
+            index: self.store.registry.label(),
+            version: pick.version.clone(),
+            checksum: pick.cksum.clone(),
+        };
+        self.chosen
+            .insert(name.to_string(), (version, canon.clone(), source.clone()));
+        Ok((canon, source))
     }
 }
 

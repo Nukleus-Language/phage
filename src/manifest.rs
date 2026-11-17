@@ -81,7 +81,21 @@ pub struct Project {
 #[serde(untagged)]
 pub enum Dependency {
     Git(GitDependency),
+    Gene(GeneDependency),
     Path(PathDependency),
+    Req(String),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneDependency {
+    pub gene: String,
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

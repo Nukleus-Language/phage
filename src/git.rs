@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::{manifest::GitDependency, ui::Ui};
+use crate::{manifest::GitDependency, registry::Registry, ui::Ui};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
@@ -11,6 +11,7 @@ pub struct Store {
     home: PathBuf,
     offline: bool,
     ui: Ui,
+    pub registry: Registry,
 }
 
 #[derive(Debug)]
@@ -21,15 +22,33 @@ pub struct Checkout {
 
 impl Store {
     pub fn new(home: PathBuf, offline: bool) -> Store {
+        let registry = Registry::new(home.clone(), offline, crate::registry::DEFAULT_INDEX);
         Store {
             home,
             offline,
             ui: Ui::default(),
+            registry,
         }
     }
 
     pub fn with_ui(mut self, ui: Ui) -> Store {
         self.ui = ui;
+        self.registry.ui = ui;
+        self
+    }
+
+    pub fn with_index(mut self, base: &str) -> Store {
+        self.registry = Registry::new(self.home.clone(), self.offline, base)
+            .with_pins(std::collections::BTreeMap::new());
+        self.registry.ui = self.ui;
+        self
+    }
+
+    pub fn with_pins(
+        mut self,
+        pins: std::collections::BTreeMap<String, crate::lock::Pin>,
+    ) -> Store {
+        self.registry = self.registry.with_pins(pins);
         self
     }
 
@@ -41,7 +60,7 @@ impl Store {
             )
             .join(".phage"),
         };
-        Ok(Store::new(home, offline))
+        Ok(Store::new(home, offline).with_index(&Registry::index_from_env()))
     }
 
     pub fn checkout(&self, name: &str, dep: &GitDependency) -> Result<Checkout, Error> {

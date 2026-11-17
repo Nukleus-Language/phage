@@ -94,6 +94,11 @@ fn source_text(gene: &Gene) -> String {
     match &gene.source {
         Source::Path => gene.dir.display().to_string(),
         Source::Git { url, sha } => format!("git+{}#{}", redact(url), sha),
+        Source::Registry {
+            index,
+            version,
+            checksum,
+        } => format!("registry+{}@{}#{}", index, version, checksum),
     }
 }
 

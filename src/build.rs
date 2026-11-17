@@ -45,7 +45,9 @@ impl Env {
         Ok(Env {
             nukleus: env::var_os("NUKLEUS").unwrap_or_else(|| OsString::from("nukleus")),
             lamina: env::var_os("LAMINA").unwrap_or_else(|| OsString::from("lamina")),
-            store: Store::from_env(opts.offline)?.with_ui(ui),
+            store: Store::from_env(opts.offline)?
+                .with_ui(ui)
+                .with_pins(lock::pins(&ws.root)?),
             target: ws.root.join("target"),
             profile: Profile::resolve(profile_name(opts)?, &ws.manifest.profile)?,
             ui,
@@ -536,6 +538,7 @@ fn gene_location(gene: &Gene) -> String {
     match &gene.source {
         Source::Path => gene.dir.display().to_string(),
         Source::Git { url, sha } => format!("{}#{}", redact(url), &sha[..sha.len().min(8)]),
+        Source::Registry { index, .. } => format!("registry+{}", index),
     }
 }
 

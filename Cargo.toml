@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 inksac = "0.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+flate2 = "1"
+tar = "0.4"
+ureq = "3"
 sha2 = "0.10"
 toml = "1.2.1"
 # clap = "2.33.3"

@@ -4,9 +4,10 @@ use crate::{
     git::redact,
     ui::Ui,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Component, Path, PathBuf},
 };
@@ -22,7 +23,62 @@ struct Lock {
 struct Entry {
     name: String,
     source: String,
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checksum: Option<String>,
     sha256: String,
+}
+
+#[derive(Deserialize)]
+struct LockFile {
+    #[serde(default)]
+    gene: Vec<Record>,
+}
+
+#[derive(Deserialize)]
+struct Record {
+    name: String,
+    source: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// A gene's recorded source and version, used to keep locked versions on the next resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub source: String,
+    pub version: String,
+}
+
+/// Reads Phage.lock under `root`; a missing file pins nothing.
+pub fn pins(root: &Path) -> Result<BTreeMap<String, Pin>, Error> {
+    let path = root.join(FILE_NAME);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(Error::from(format!(
+                "Could not read '{}': {}",
+                path.display(),
+                e
+            )));
+        }
+    };
+    let file: LockFile = toml::from_str(&text)
+        .map_err(|e| Error::from(format!("Could not parse '{}': {}", path.display(), e)))?;
+    Ok(file
+        .gene
+        .into_iter()
+        .map(|record| {
+            (
+                record.name,
+                Pin {
+                    source: record.source,
+                    version: record.version,
+                },
+            )
+        })
+        .collect())
 }
 
 pub fn sync(root: &Path, graph: &Graph, locked: bool, ui: Ui) -> Result<(), Error> {
@@ -65,6 +121,11 @@ fn render(root: &Path, genes: &[Gene]) -> Result<String, Error> {
             Ok(Entry {
                 name: gene.name.clone(),
                 source: source(&root, gene),
+                version: gene.version.clone(),
+                checksum: match &gene.source {
+                    Source::Registry { checksum, .. } => Some(checksum.clone()),
+                    _ => None,
+                },
                 sha256: digest(&gene.dir)?,
             })
         })
@@ -77,6 +138,7 @@ fn source(root: &Path, gene: &Gene) -> String {
     match &gene.source {
         Source::Path => slash(&relative(root, &gene.dir)),
         Source::Git { url, sha } => format!("git+{}#{}", redact(url), sha),
+        Source::Registry { index, .. } => format!("registry+{}", index),
     }
 }
 

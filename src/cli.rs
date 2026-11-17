@@ -3,9 +3,11 @@ use crate::{
     build, help, project,
     ui::{self, ColorChoice, Ui, Verbosity},
 };
+use crate::{git::Store, package, registry};
 use std::{
     env,
     io::{self, IsTerminal},
+    path::Path,
     process,
 };
 
@@ -117,6 +119,10 @@ fn dispatch(rest: &[String], ui: Ui, stdout_color: bool) -> Result<i32, Error> {
                 "test" => test(args, ui),
                 "run" => run_cmd(args, ui),
                 "clean" => clean(args, ui),
+                "package" => package_cmd(args, ui),
+                "publish" => publish_cmd(args, ui),
+                "search" => search_cmd(args, ui),
+                "index" => index_cmd(args, ui),
                 _ => Err(Error::from(unknown_command(name))),
             }
         }
@@ -208,6 +214,104 @@ fn run_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
     } else {
         build::run(opts, program_args, ui)
     }
+}
+
+fn package_names(args: &[String], command: &str) -> Result<Vec<String>, Error> {
+    let mut names = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-p" | "--package" => names.push(value(&mut iter, arg)?),
+            other => {
+                return Err(usage_error(
+                    Error::from(format!("Unknown option '{}' for '{}'.", other, command)),
+                    command,
+                ));
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn package_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
+    let names = package_names(args, "package")?;
+    package::package(&names, ui, false)?;
+    Ok(0)
+}
+
+fn publish_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
+    let names = package_names(args, "publish")?;
+    package::package(&names, ui, true)?;
+    Ok(0)
+}
+
+fn search_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
+    let mut query = None;
+    let mut offline = false;
+    for arg in args {
+        match arg.as_str() {
+            "--offline" => offline = true,
+            other if other.starts_with('-') => {
+                return Err(usage_error(
+                    Error::from(format!("Unknown option '{}' for 'search'.", other)),
+                    "search",
+                ));
+            }
+            other if query.is_none() => query = Some(other.to_string()),
+            other => {
+                return Err(usage_error(
+                    Error::from(format!("Unexpected argument '{}' for 'search'.", other)),
+                    "search",
+                ));
+            }
+        }
+    }
+    let query =
+        query.ok_or_else(|| usage_error(Error::from("Please provide a search term."), "search"))?;
+    let store = Store::from_env(offline)?.with_ui(ui);
+    for name in store.registry.search(&query)? {
+        println!("{}", name);
+    }
+    Ok(0)
+}
+
+fn index_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
+    if args.first().map(String::as_str) != Some("check") {
+        return Err(usage_error(
+            Error::from("Expected 'phage index check [dir]'."),
+            "index",
+        ));
+    }
+    let mut dir = None;
+    let mut download = true;
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--no-download" => download = false,
+            other if other.starts_with('-') => {
+                return Err(usage_error(
+                    Error::from(format!("Unknown option '{}' for 'index check'.", other)),
+                    "index",
+                ));
+            }
+            other if dir.is_none() => dir = Some(other.to_string()),
+            other => {
+                return Err(usage_error(
+                    Error::from(format!(
+                        "Unexpected argument '{}' for 'index check'.",
+                        other
+                    )),
+                    "index",
+                ));
+            }
+        }
+    }
+    let dir = dir.unwrap_or_else(|| ".".to_string());
+    let checked = registry::check_index(Path::new(&dir), download)?;
+    ui.status(
+        "Checked",
+        &format!("{} version line(s) in {}", checked, dir),
+    );
+    Ok(0)
 }
 
 fn scaffold_args<'a>(

@@ -81,6 +81,21 @@ impl Workspace {
             .collect()
     }
 
+    /// The one selected package; `verb` names the command in the error.
+    pub fn only(&self, names: &[String], verb: &str) -> Result<&Package, Error> {
+        let selected = self.select(names)?;
+        match selected.as_slice() {
+            [package] => Ok(*package),
+            _ => Err(Error::with_help(
+                format!("{} needs exactly one package", verb),
+                format!(
+                    "pass -p <name>; packages: {}",
+                    self.package_names().join(", ")
+                ),
+            )),
+        }
+    }
+
     pub fn package_names(&self) -> Vec<&str> {
         self.packages
             .iter()
