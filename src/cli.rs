@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::{
     build, help, project,
     ui::{self, ColorChoice, Ui, Verbosity},
@@ -14,8 +15,8 @@ struct Globals {
     verbosity: Verbosity,
 }
 
-pub fn fail(color: bool, msg: &str) -> ! {
-    ui::print_error(msg, color);
+pub fn fail(color: bool, err: &Error) -> ! {
+    ui::print_error(err, color);
     process::exit(1);
 }
 
@@ -38,7 +39,7 @@ pub fn run(args: &[String]) {
     process::exit(code);
 }
 
-fn split_globals(args: &[String]) -> Result<(Globals, Vec<String>), String> {
+fn split_globals(args: &[String]) -> Result<(Globals, Vec<String>), Error> {
     let mut color = ColorChoice::default();
     let mut quiet = false;
     let mut verbose = false;
@@ -55,7 +56,7 @@ fn split_globals(args: &[String]) -> Result<(Globals, Vec<String>), String> {
             "-v" | "--verbose" => verbose = true,
             "--color" => {
                 let value = iter.next().ok_or_else(|| {
-                    ui::with_help("'--color' needs a value", "expected never, always or auto")
+                    Error::with_help("'--color' needs a value", "expected never, always or auto")
                 })?;
                 color = ColorChoice::parse(value)?;
             }
@@ -66,7 +67,9 @@ fn split_globals(args: &[String]) -> Result<(Globals, Vec<String>), String> {
         }
     }
     if quiet && verbose {
-        return Err("'--verbose' and '--quiet' cannot be used together.".to_string());
+        return Err(Error::from(
+            "'--verbose' and '--quiet' cannot be used together.".to_string(),
+        ));
     }
     let verbosity = match (quiet, verbose) {
         (true, _) => Verbosity::Quiet,
@@ -76,7 +79,7 @@ fn split_globals(args: &[String]) -> Result<(Globals, Vec<String>), String> {
     Ok((Globals { color, verbosity }, rest))
 }
 
-fn dispatch(rest: &[String], ui: Ui, stdout_color: bool) -> Result<i32, String> {
+fn dispatch(rest: &[String], ui: Ui, stdout_color: bool) -> Result<i32, Error> {
     let Some((name, args)) = rest.split_first() else {
         print!("{}", help::main_help(stdout_color));
         return Ok(1);
@@ -113,7 +116,8 @@ fn dispatch(rest: &[String], ui: Ui, stdout_color: bool) -> Result<i32, String> 
                 "build" => build_cmd(args, ui),
                 "test" => test(args, ui),
                 "run" => run_cmd(args, ui),
-                _ => Err(unknown_command(name)),
+                "clean" => clean(args, ui),
+                _ => Err(Error::from(unknown_command(name))),
             }
         }
     }
@@ -125,42 +129,45 @@ fn wants_help(args: &[String]) -> bool {
         .any(|arg| arg == "-h" || arg == "--help")
 }
 
-fn unknown_command(name: &str) -> String {
+fn unknown_command(name: &str) -> Error {
     let msg = format!("no such command: '{}'", name);
     match help::suggest(name) {
-        Some(close) => ui::with_help(msg, format!("a similar command exists: '{}'", close)),
-        None => ui::with_help(msg, "run 'phage help' to list the commands"),
+        Some(close) => Error::with_help(msg, format!("a similar command exists: '{}'", close)),
+        None => Error::with_help(msg, "run 'phage help' to list the commands"),
     }
 }
 
-fn usage_error(msg: String, command: &str) -> String {
-    ui::with_help(msg, format!("run 'phage help {}' for usage", command))
+fn usage_error(err: Error, command: &str) -> Error {
+    Error::with_help(err.msg, format!("run 'phage help {}' for usage", command))
 }
 
-fn init(args: &[String]) -> Result<i32, String> {
+fn init(args: &[String]) -> Result<i32, Error> {
     let (name, kind) = scaffold_args(args, "init").map_err(|e| usage_error(e, "init"))?;
     if name.is_some() {
-        return Err("'init' takes no project name; use 'new' for a new directory.".to_string());
+        return Err(Error::from(
+            "'init' takes no project name; use 'new' for a new directory.".to_string(),
+        ));
     }
-    let path =
-        env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
-    project::init(&path, kind).map_err(|e| format!("Could not create project: {}", e))?;
+    let path = env::current_dir()
+        .map_err(|e| Error::from(format!("Could not read the current directory: {}", e)))?;
+    project::init(&path, kind)
+        .map_err(|e| Error::from(format!("Could not create project: {}", e)))?;
     Ok(0)
 }
 
-fn new(args: &[String]) -> Result<i32, String> {
+fn new(args: &[String]) -> Result<i32, Error> {
     let (name, kind) = scaffold_args(args, "new").map_err(|e| usage_error(e, "new"))?;
     let name =
-        name.ok_or_else(|| usage_error("Please provide a project name.".to_string(), "new"))?;
+        name.ok_or_else(|| usage_error(Error::from("Please provide a project name."), "new"))?;
     project::new(name, kind)?;
     Ok(0)
 }
 
-fn check(args: &[String], ui: Ui) -> Result<i32, String> {
+fn check(args: &[String], ui: Ui) -> Result<i32, Error> {
     let opts = flags(args, "check").map_err(|e| usage_error(e, "check"))?;
     if opts.release {
         return Err(usage_error(
-            "Unknown option '--release' for 'check'.".to_string(),
+            Error::from("Unknown option '--release' for 'check'."),
             "check",
         ));
     }
@@ -168,18 +175,29 @@ fn check(args: &[String], ui: Ui) -> Result<i32, String> {
     Ok(0)
 }
 
-fn build_cmd(args: &[String], ui: Ui) -> Result<i32, String> {
+fn build_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
     let opts = flags(args, "build").map_err(|e| usage_error(e, "build"))?;
     build::build(opts, ui)?;
     Ok(0)
 }
 
-fn test(args: &[String], ui: Ui) -> Result<i32, String> {
+fn test(args: &[String], ui: Ui) -> Result<i32, Error> {
     let (opts, filter) = test_flags(args).map_err(|e| usage_error(e, "test"))?;
     build::test(opts, filter.as_deref(), ui)
 }
 
-fn run_cmd(args: &[String], ui: Ui) -> Result<i32, String> {
+fn clean(args: &[String], ui: Ui) -> Result<i32, Error> {
+    if let Some(extra) = args.first() {
+        return Err(usage_error(
+            Error::from(format!("Unexpected argument '{}' for 'clean'.", extra)),
+            "clean",
+        ));
+    }
+    build::clean(ui)?;
+    Ok(0)
+}
+
+fn run_cmd(args: &[String], ui: Ui) -> Result<i32, Error> {
     let (opts, program_args) = match args.iter().position(|a| a == "--") {
         Some(i) => (&args[..i], &args[i + 1..]),
         None => (args, &args[args.len()..]),
@@ -195,28 +213,31 @@ fn run_cmd(args: &[String], ui: Ui) -> Result<i32, String> {
 fn scaffold_args<'a>(
     args: &'a [String],
     command: &str,
-) -> Result<(Option<&'a str>, project::Kind), String> {
+) -> Result<(Option<&'a str>, project::Kind), Error> {
     let mut name = None;
     let mut kind = project::Kind::Bin;
     for arg in args {
         match arg.as_str() {
             "--lib" => kind = project::Kind::Lib,
             other if other.starts_with('-') => {
-                return Err(format!("Unknown option '{}' for '{}'.", other, command));
+                return Err(Error::from(format!(
+                    "Unknown option '{}' for '{}'.",
+                    other, command
+                )));
             }
             other if name.is_none() => name = Some(other),
             other => {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "Unexpected argument '{}' for '{}'.",
                     other, command
-                ));
+                )));
             }
         }
     }
     Ok((name, kind))
 }
 
-fn flags(args: &[String], command: &str) -> Result<build::Options, String> {
+fn flags(args: &[String], command: &str) -> Result<build::Options, Error> {
     let mut flags = build::Options::default();
     for arg in args {
         match arg.as_str() {
@@ -224,20 +245,23 @@ fn flags(args: &[String], command: &str) -> Result<build::Options, String> {
             "--locked" => flags.locked = true,
             "--offline" => flags.offline = true,
             other => {
-                return Err(format!("Unknown option '{}' for '{}'.", other, command));
+                return Err(Error::from(format!(
+                    "Unknown option '{}' for '{}'.",
+                    other, command
+                )));
             }
         }
     }
     Ok(flags)
 }
 
-fn run_flags(args: &[String]) -> Result<(bool, build::Options), String> {
+fn run_flags(args: &[String]) -> Result<(bool, build::Options), Error> {
     let jit = args.iter().any(|arg| arg == "--jit");
     let rest: Vec<String> = args.iter().filter(|arg| *arg != "--jit").cloned().collect();
     Ok((jit, flags(&rest, "run")?))
 }
 
-fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), String> {
+fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), Error> {
     let mut opts = build::Options::default();
     let mut filter = None;
     let mut rest = args.iter();
@@ -251,7 +275,12 @@ fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), Strin
                     .ok_or_else(|| "'--filter' needs a value.".to_string())?;
                 filter = Some(value.clone());
             }
-            other => return Err(format!("Unknown option '{}' for 'test'.", other)),
+            other => {
+                return Err(Error::from(format!(
+                    "Unknown option '{}' for 'test'.",
+                    other
+                )));
+            }
         }
     }
     Ok((opts, filter))
@@ -420,15 +449,15 @@ mod tests {
     #[test]
     fn unknown_command_suggests_closest_name() {
         let err = unknown_command("buidl");
-        let (msg, hint) = ui::split_help(&err);
-        assert_eq!(msg, "no such command: 'buidl'");
+        let hint = err.help.as_deref();
+        assert_eq!(err.msg, "no such command: 'buidl'");
         assert_eq!(hint, Some("a similar command exists: 'build'"));
     }
 
     #[test]
     fn usage_errors_point_at_command_help() {
         let err = usage_error(flags(&args(&["--frozen"]), "build").unwrap_err(), "build");
-        let (_, hint) = ui::split_help(&err);
+        let hint = err.help.as_deref();
         assert_eq!(hint, Some("run 'phage help build' for usage"));
     }
 }

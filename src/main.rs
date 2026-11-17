@@ -1,6 +1,8 @@
 mod build;
 mod cli;
 mod deps;
+mod error;
+mod fingerprint;
 mod git;
 mod help;
 mod lock;

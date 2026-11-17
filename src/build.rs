@@ -1,3 +1,5 @@
+use crate::error::Error;
+use crate::fingerprint::{self, Stamp};
 use crate::{
     deps::{self, Gene, Graph, Source},
     git::{Store, redact},
@@ -32,19 +34,10 @@ struct Target {
     store: Store,
 }
 
-fn resolve(offline: bool, ui: Ui) -> Result<Target, String> {
-    let cwd =
-        env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
-    let manifest_path = find_manifest(&cwd).ok_or_else(|| {
-        ui::with_help(
-            format!(
-                "No {} found in '{}' or any parent directory.",
-                FILE_NAME,
-                cwd.display()
-            ),
-            "run 'phage init' or 'phage new <name>' to create a project",
-        )
-    })?;
+fn resolve(offline: bool, ui: Ui) -> Result<Target, Error> {
+    let cwd = env::current_dir()
+        .map_err(|e| Error::from(format!("Could not read the current directory: {}", e)))?;
+    let manifest_path = find_manifest(&cwd).ok_or_else(|| missing_manifest(&cwd))?;
     let root = manifest_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -57,6 +50,47 @@ fn resolve(offline: bool, ui: Ui) -> Result<Target, String> {
         manifest,
         store: Store::from_env(offline)?.with_ui(ui),
     })
+}
+
+fn missing_manifest(cwd: &Path) -> Error {
+    Error::with_help(
+        format!(
+            "No {} found in '{}' or any parent directory.",
+            FILE_NAME,
+            cwd.display()
+        ),
+        "run 'phage init' or 'phage new <name>' to create a project",
+    )
+}
+
+pub fn clean(ui: Ui) -> Result<(), Error> {
+    let cwd = env::current_dir()
+        .map_err(|e| Error::from(format!("Could not read the current directory: {}", e)))?;
+    let manifest_path = find_manifest(&cwd).ok_or_else(|| missing_manifest(&cwd))?;
+    let root = manifest_path.parent().unwrap_or(Path::new("."));
+    if remove_target(root)? {
+        ui.status("Removed", &format!("`{}`", root.join("target").display()));
+    }
+    Ok(())
+}
+
+/// Removes `<root>/target` only when the project's own manifest sits beside it.
+fn remove_target(root: &Path) -> Result<bool, Error> {
+    let target = root.join("target");
+    if !target.is_dir() {
+        return Ok(false);
+    }
+    let owned = target.file_name() == Some(OsStr::new("target")) && root.join(FILE_NAME).is_file();
+    if !owned {
+        return Err(Error::from(format!(
+            "Refusing to remove '{}': no {} beside it",
+            target.display(),
+            FILE_NAME
+        )));
+    }
+    fs::remove_dir_all(&target)
+        .map_err(|e| Error::from(format!("Could not remove '{}': {}", target.display(), e)))?;
+    Ok(true)
 }
 
 fn profile_name(release: bool) -> &'static str {
@@ -105,7 +139,7 @@ struct Roots {
     lib: Option<PathBuf>,
 }
 
-fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
+fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, Error> {
     let bin = root.join(BIN_ROOT);
     let lib = root.join(manifest.lib_path());
     let roots = Roots {
@@ -113,16 +147,16 @@ fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
         lib: lib.is_file().then_some(lib),
     };
     if roots.bin.is_none() && roots.lib.is_none() {
-        return Err(format!(
+        return Err(Error::from(format!(
             "No binary root ({}) or library root ({}) found.",
             BIN_ROOT,
             manifest.lib_path().display()
-        ));
+        )));
     }
     Ok(roots)
 }
 
-pub fn test(opts: Options, filter: Option<&str>, ui: Ui) -> Result<i32, String> {
+pub fn test(opts: Options, filter: Option<&str>, ui: Ui) -> Result<i32, Error> {
     let start = Instant::now();
     let target = resolve(opts.offline, ui)?;
     sync_lock(&target, opts.locked, ui)?;
@@ -147,11 +181,11 @@ fn test_with(
     store: &Store,
     filter: Option<&str>,
     ui: Ui,
-) -> Result<i32, String> {
+) -> Result<i32, Error> {
     let roots = roots(root, manifest)?;
     let out_dir = root.join("target").join("test");
     fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not create '{}': {}", out_dir.display(), e)))?;
     let graph = deps::collect(root, manifest, store)?;
     let mut targets: Vec<(&Path, String)> = Vec::new();
     if let Some(bin) = &roots.bin {
@@ -160,26 +194,42 @@ fn test_with(
     if let Some(lib) = &roots.lib {
         targets.push((lib.as_path(), format!("{}-lib", manifest.project.name)));
     }
-    announce(ui, "Compiling", manifest, root, &graph);
+    let sources = fingerprint::sources(nukleus, root, &graph)?;
+    let jobs: Vec<(PathBuf, Job)> = targets
+        .iter()
+        .map(|(input, name)| {
+            let path = out_dir.join(name);
+            let job = plan(
+                nukleus,
+                input,
+                &Output::Test {
+                    path: &path,
+                    filter,
+                },
+                &graph,
+                &manifest.lints,
+                &sources,
+            );
+            (path, job)
+        })
+        .collect();
+    announce(
+        ui,
+        verb(jobs.iter().map(|(_, job)| job), "Compiling"),
+        manifest,
+        root,
+        &graph,
+    );
     let mut code = 0;
-    for (input, name) in targets {
-        let path = out_dir.join(name);
-        compile(
-            nukleus,
-            input,
-            &Output::Test {
-                path: &path,
-                filter,
-            },
-            &graph,
-            &manifest.lints,
-            ui,
-        )?;
+    for (path, job) in &jobs {
+        if !job.is_fresh() {
+            run_job(job, ui)?;
+        }
         ui.status("Running", &format!("`{}`", path.display()));
         let status = Command::new(&path)
             .current_dir(root)
             .status()
-            .map_err(|e| format!("Could not run '{}': {}", path.display(), e))?;
+            .map_err(|e| Error::from(format!("Could not run '{}': {}", path.display(), e)))?;
         if code == 0 {
             code = status.code().unwrap_or(1);
         }
@@ -187,12 +237,12 @@ fn test_with(
     Ok(code)
 }
 
-fn sync_lock(target: &Target, locked: bool, ui: Ui) -> Result<(), String> {
+fn sync_lock(target: &Target, locked: bool, ui: Ui) -> Result<(), Error> {
     let graph = deps::collect(&target.root, &target.manifest, &target.store)?;
     lock::sync(&target.root, &graph, locked, ui)
 }
 
-pub fn build(opts: Options, ui: Ui) -> Result<(), String> {
+pub fn build(opts: Options, ui: Ui) -> Result<(), Error> {
     let start = Instant::now();
     let target = resolve(opts.offline, ui)?;
     sync_lock(&target, opts.locked, ui)?;
@@ -217,7 +267,7 @@ fn build_roots(
     store: &Store,
     release: bool,
     ui: Ui,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Error> {
     let roots = roots(root, manifest)?;
     if roots.bin.is_some() {
         build_with(nukleus, root, manifest, store, release, ui)?;
@@ -234,7 +284,7 @@ fn build_roots(
     }))
 }
 
-pub fn run(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, String> {
+pub fn run(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, Error> {
     let target = resolve(opts.offline, ui)?;
     sync_lock(&target, opts.locked, ui)?;
     run_with(
@@ -256,7 +306,7 @@ fn run_with(
     release: bool,
     program_args: &[String],
     ui: Ui,
-) -> Result<i32, String> {
+) -> Result<i32, Error> {
     let start = Instant::now();
     let binary = build_with(nukleus, root, manifest, store, release, ui)?;
     finished(ui, profile_name(release), start);
@@ -264,13 +314,13 @@ fn run_with(
     let status = Command::new(&binary)
         .args(program_args)
         .status()
-        .map_err(|e| format!("Could not run '{}': {}", binary.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not run '{}': {}", binary.display(), e)))?;
     Ok(status.code().unwrap_or(1))
 }
 
-pub fn run_jit(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, String> {
+pub fn run_jit(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, Error> {
     if let Some(err) = jit_host_error(env::consts::ARCH, env::consts::OS) {
-        return Err(err);
+        return Err(Error::from(err));
     }
     let target = resolve(opts.offline, ui)?;
     sync_lock(&target, opts.locked, ui)?;
@@ -286,9 +336,9 @@ pub fn run_jit(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, St
     )
 }
 
-fn jit_host_error(arch: &str, os: &str) -> Option<String> {
+fn jit_host_error(arch: &str, os: &str) -> Option<Error> {
     (arch != "x86_64" || os != "linux").then(|| {
-        ui::with_help(
+        Error::with_help(
             format!("'run --jit' runs only on x86_64 Linux for now; this host is {arch} {os}."),
             "use 'phage run' instead",
         )
@@ -304,24 +354,28 @@ fn run_jit_with(
     release: bool,
     program_args: &[String],
     ui: Ui,
-) -> Result<i32, String> {
+) -> Result<i32, Error> {
     let start = Instant::now();
     let bin = roots(root, manifest)?
         .bin
         .ok_or_else(|| format!("no binary root: {} not found", BIN_ROOT))?;
     let out_dir = root.join("target").join("jit");
     fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not create '{}': {}", out_dir.display(), e)))?;
     let graph = deps::collect(root, manifest, store)?;
-    announce(ui, "Compiling", manifest, root, &graph);
-    compile(
+    let sources = fingerprint::sources(nukleus, root, &graph)?;
+    let job = plan(
         nukleus,
         &bin,
         &Output::Jit { out_dir: &out_dir },
         &graph,
         &manifest.lints,
-        ui,
-    )?;
+        &sources,
+    );
+    announce(ui, verb([&job], "Compiling"), manifest, root, &graph);
+    if !job.is_fresh() {
+        run_job(&job, ui)?;
+    }
     finished(ui, profile_name(release), start);
     let ir = out_dir
         .join(bin.file_stem().unwrap_or_default())
@@ -337,16 +391,20 @@ fn run_jit_with(
         .status()
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
-                ui::with_help(
+                Error::with_help(
                     format!("lamina not found ('{}')", program.to_string_lossy()),
                     "put it on PATH or set LAMINA to its path",
                 )
             } else {
-                format!("Could not run '{}': {}", program.to_string_lossy(), e)
+                Error::from(format!(
+                    "Could not run '{}': {}",
+                    program.to_string_lossy(),
+                    e
+                ))
             }
         })?;
     match status.code().unwrap_or(1) {
-        JIT_REFUSED_EXIT_CODE => Err(ui::with_help(
+        JIT_REFUSED_EXIT_CODE => Err(Error::with_help(
             "lamina could not JIT this program (its reason is above)",
             "use 'phage run' to build it ahead of time instead",
         )),
@@ -372,7 +430,7 @@ fn jit_command(
     (lamina.to_os_string(), args)
 }
 
-pub fn check(opts: Options, ui: Ui) -> Result<(), String> {
+pub fn check(opts: Options, ui: Ui) -> Result<(), Error> {
     let start = Instant::now();
     let target = resolve(opts.offline, ui)?;
     sync_lock(&target, opts.locked, ui)?;
@@ -393,7 +451,7 @@ fn check_with(
     manifest: &Manifest,
     store: &Store,
     ui: Ui,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let roots = roots(root, manifest)?;
     let inputs: Vec<&Path> = roots
         .bin
@@ -411,23 +469,32 @@ fn check_inputs(
     store: &Store,
     inputs: &[&Path],
     ui: Ui,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let out_dir = root.join("target").join("check");
     fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not create '{}': {}", out_dir.display(), e)))?;
     let graph = deps::collect(root, manifest, store)?;
-    if !inputs.is_empty() {
-        announce(ui, "Checking", manifest, root, &graph);
+    let sources = fingerprint::sources(nukleus, root, &graph)?;
+    let jobs: Vec<Job> = inputs
+        .iter()
+        .map(|input| {
+            plan(
+                nukleus,
+                input,
+                &Output::Check { out_dir: &out_dir },
+                &graph,
+                &manifest.lints,
+                &sources,
+            )
+        })
+        .collect();
+    if !jobs.is_empty() {
+        announce(ui, verb(&jobs, "Checking"), manifest, root, &graph);
     }
-    for input in inputs {
-        compile(
-            nukleus,
-            input,
-            &Output::Check { out_dir: &out_dir },
-            &graph,
-            &manifest.lints,
-            ui,
-        )?;
+    for job in &jobs {
+        if !job.is_fresh() {
+            run_job(job, ui)?;
+        }
     }
     Ok(())
 }
@@ -439,18 +506,18 @@ fn build_with(
     store: &Store,
     release: bool,
     ui: Ui,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, Error> {
     let bin = roots(root, manifest)?
         .bin
         .ok_or_else(|| format!("no binary root: {} not found", BIN_ROOT))?;
     let profile = if release { "release" } else { "debug" };
     let out_dir = root.join("target").join(profile);
     fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not create '{}': {}", out_dir.display(), e)))?;
     let out = out_dir.join(&manifest.project.name);
     let graph = deps::collect(root, manifest, store)?;
-    announce(ui, "Compiling", manifest, root, &graph);
-    compile(
+    let sources = fingerprint::sources(nukleus, root, &graph)?;
+    let job = plan(
         nukleus,
         &bin,
         &Output::Binary {
@@ -459,19 +526,36 @@ fn build_with(
         },
         &graph,
         &manifest.lints,
-        ui,
-    )?;
+        &sources,
+    );
+    announce(ui, verb([&job], "Compiling"), manifest, root, &graph);
+    if !job.is_fresh() {
+        run_job(&job, ui)?;
+    }
     Ok(out)
 }
 
-fn compile(
+struct Job {
+    program: OsString,
+    args: Vec<OsString>,
+    failure: &'static str,
+    stamp: Stamp,
+}
+
+impl Job {
+    fn is_fresh(&self) -> bool {
+        self.stamp.is_fresh()
+    }
+}
+
+fn plan(
     nukleus: &OsStr,
     input: &Path,
     output: &Output,
     graph: &Graph,
     lints: &BTreeMap<String, LintLevel>,
-    ui: Ui,
-) -> Result<(), String> {
+    sources: &str,
+) -> Job {
     let (program, args) = compile_command(&CompileCommand {
         nukleus,
         input,
@@ -479,24 +563,51 @@ fn compile(
         graph,
         lints,
     });
+    let artifact = output.artifact(input);
+    let stamp = Stamp::new(&artifact, sources, &args);
+    Job {
+        program,
+        args,
+        failure: output.failure(),
+        stamp,
+    }
+}
+
+fn run_job(job: &Job, ui: Ui) -> Result<(), Error> {
+    job.stamp.clear()?;
     ui.verbose(
         "Running",
-        &format!("`{}`", ui::render_command(&program, &args)),
+        &format!("`{}`", ui::render_command(&job.program, &job.args)),
     );
-    let status = Command::new(&program).args(&args).status().map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            ui::with_help(
-                format!("nukleus not found ('{}')", program.to_string_lossy()),
-                "put it on PATH or set NUKLEUS to its path",
-            )
-        } else {
-            format!("Could not run '{}': {}", program.to_string_lossy(), e)
-        }
-    })?;
+    let status = Command::new(&job.program)
+        .args(&job.args)
+        .status()
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                Error::with_help(
+                    format!("nukleus not found ('{}')", job.program.to_string_lossy()),
+                    "put it on PATH or set NUKLEUS to its path",
+                )
+            } else {
+                Error::from(format!(
+                    "Could not run '{}': {}",
+                    job.program.to_string_lossy(),
+                    e
+                ))
+            }
+        })?;
     if !status.success() {
-        return Err(output.failure().to_string());
+        return Err(Error::from(job.failure));
     }
-    Ok(())
+    job.stamp.write()
+}
+
+fn verb<'a>(jobs: impl IntoIterator<Item = &'a Job>, stale: &'static str) -> &'static str {
+    if jobs.into_iter().all(Job::is_fresh) {
+        "Fresh"
+    } else {
+        stale
+    }
 }
 
 enum Output<'a> {
@@ -517,6 +628,15 @@ enum Output<'a> {
 }
 
 impl Output<'_> {
+    fn artifact(&self, input: &Path) -> PathBuf {
+        match self {
+            Output::Binary { path, .. } | Output::Test { path, .. } => path.to_path_buf(),
+            Output::Check { out_dir } | Output::Jit { out_dir } => out_dir
+                .join(input.file_stem().unwrap_or_default())
+                .with_extension("lamina"),
+        }
+    }
+
     fn failure(&self) -> &'static str {
         match self {
             Output::Binary { .. } | Output::Jit { .. } => "build failed",
@@ -1009,7 +1129,10 @@ chmod +x \"$out\"
                 Ui::default(),
             )
             .unwrap_err();
-            assert!(err.contains("NUKLEUS"), "{err}");
+            assert!(
+                err.help.as_deref().is_some_and(|h| h.contains("NUKLEUS")),
+                "{err}"
+            );
             fs::remove_dir_all(&root)?;
             Ok(())
         }
@@ -1345,7 +1468,10 @@ exit 7
                 Ui::default(),
             )
             .unwrap_err();
-            assert!(err.contains("phage run"), "{err}");
+            assert!(
+                err.help.as_deref().is_some_and(|h| h.contains("phage run")),
+                "{err}"
+            );
             Ok(())
         }
 
@@ -1392,8 +1518,179 @@ exit 7
                 Ui::default(),
             )
             .unwrap_err();
-            assert!(err.contains("LAMINA"), "{err}");
+            assert!(
+                err.help.as_deref().is_some_and(|h| h.contains("LAMINA")),
+                "{err}"
+            );
             Ok(())
         }
+
+        const COUNTING_NUKLEUS: &str = "#!/bin/sh
+if [ \"$1\" = \"--version\" ]; then echo fake-1; exit 0; fi
+echo run >> \"LOG\"
+dir=\"\"
+out=\"\"
+last=\"\"
+while [ $# -gt 0 ]; do
+  if [ \"$1\" = \"--out-dir\" ]; then dir=\"$2\"; shift; fi
+  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift; fi
+  last=\"$1\"
+  shift
+done
+if [ -n \"$dir\" ]; then
+  mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
+else
+  printf '#!/bin/sh\\necho built\\nexit 0\\n' > \"$out\"
+  chmod +x \"$out\"
+fi
+";
+
+        fn counting_setup(tag: &str) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+            let root = project(tag)?;
+            let log = root.join("invocations");
+            let nukleus = root.join("fake-nukleus");
+            let script = COUNTING_NUKLEUS.replace("LOG", &log.display().to_string());
+            write_exec(&nukleus, &script)?;
+            Ok((root, nukleus, log))
+        }
+
+        fn invocations(log: &Path) -> usize {
+            fs::read_to_string(log).map_or(0, |text| text.lines().count())
+        }
+
+        fn build_once(nukleus: &Path, root: &Path) -> io::Result<()> {
+            build_with(
+                nukleus.as_os_str(),
+                root,
+                &demo(),
+                &store(root),
+                false,
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
+            Ok(())
+        }
+
+        #[test]
+        fn build_skips_nukleus_when_fresh() -> io::Result<()> {
+            let _guard = lock();
+            let (root, nukleus, log) = counting_setup("fresh")?;
+            build_once(&nukleus, &root)?;
+            build_once(&nukleus, &root)?;
+            let stamped = root.join("target/debug/.fingerprint/demo").is_file();
+            let runs = invocations(&log);
+            fs::remove_dir_all(&root)?;
+            assert_eq!(runs, 1);
+            assert!(stamped);
+            Ok(())
+        }
+
+        #[test]
+        fn build_reruns_after_source_edit() -> io::Result<()> {
+            let _guard = lock();
+            let (root, nukleus, log) = counting_setup("edit")?;
+            build_once(&nukleus, &root)?;
+            fs::write(root.join("src/main.nk"), "changed")?;
+            build_once(&nukleus, &root)?;
+            let runs = invocations(&log);
+            fs::remove_dir_all(&root)?;
+            assert_eq!(runs, 2);
+            Ok(())
+        }
+
+        #[test]
+        fn build_reruns_when_output_is_missing() -> io::Result<()> {
+            let _guard = lock();
+            let (root, nukleus, log) = counting_setup("missing")?;
+            build_once(&nukleus, &root)?;
+            fs::remove_file(root.join("target/debug/demo"))?;
+            build_once(&nukleus, &root)?;
+            let runs = invocations(&log);
+            fs::remove_dir_all(&root)?;
+            assert_eq!(runs, 2);
+            Ok(())
+        }
+
+        #[test]
+        fn build_reruns_when_lints_change() -> io::Result<()> {
+            let _guard = lock();
+            let (root, nukleus, log) = counting_setup("lints")?;
+            build_once(&nukleus, &root)?;
+            let mut linted = demo();
+            linted
+                .lints
+                .insert("never_mutated".to_string(), LintLevel::Warn);
+            build_with(
+                nukleus.as_os_str(),
+                &root,
+                &linted,
+                &store(&root),
+                false,
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
+            let runs = invocations(&log);
+            fs::remove_dir_all(&root)?;
+            assert_eq!(runs, 2);
+            Ok(())
+        }
+
+        #[test]
+        fn check_skips_nukleus_when_fresh() -> io::Result<()> {
+            let _guard = lock();
+            let (root, nukleus, log) = counting_setup("check_fresh")?;
+            for _ in 0..2 {
+                check_with(
+                    nukleus.as_os_str(),
+                    &root,
+                    &demo(),
+                    &store(&root),
+                    Ui::default(),
+                )
+                .map_err(io::Error::other)?;
+            }
+            let runs = invocations(&log);
+            fs::remove_dir_all(&root)?;
+            assert_eq!(runs, 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clean_removes_target_beside_manifest() -> io::Result<()> {
+        use crate::testutil::temp_dir;
+        let root = temp_dir("clean_ok")?;
+        fs::write(root.join(FILE_NAME), "")?;
+        fs::create_dir_all(root.join("target/debug"))?;
+        let removed = remove_target(&root).map_err(io::Error::other);
+        let gone = !root.join("target").exists();
+        fs::remove_dir_all(&root)?;
+        assert!(removed?);
+        assert!(gone);
+        Ok(())
+    }
+
+    #[test]
+    fn clean_refuses_target_without_manifest_beside_it() -> io::Result<()> {
+        use crate::testutil::temp_dir;
+        let root = temp_dir("clean_refuse")?;
+        fs::create_dir_all(root.join("target"))?;
+        let err = remove_target(&root).unwrap_err();
+        let kept = root.join("target").is_dir();
+        fs::remove_dir_all(&root)?;
+        assert!(err.contains("Refusing"), "{err}");
+        assert!(kept);
+        Ok(())
+    }
+
+    #[test]
+    fn clean_without_target_removes_nothing() -> io::Result<()> {
+        use crate::testutil::temp_dir;
+        let root = temp_dir("clean_none")?;
+        fs::write(root.join(FILE_NAME), "")?;
+        let removed = remove_target(&root).map_err(io::Error::other);
+        fs::remove_dir_all(&root)?;
+        assert!(!removed?);
+        Ok(())
     }
 }

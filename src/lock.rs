@@ -1,7 +1,8 @@
+use crate::error::Error;
 use crate::{
     deps::{Gene, Graph, Source},
     git::redact,
-    ui::{self, Ui},
+    ui::Ui,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -24,19 +25,25 @@ struct Entry {
     sha256: String,
 }
 
-pub fn sync(root: &Path, graph: &Graph, locked: bool, ui: Ui) -> Result<(), String> {
+pub fn sync(root: &Path, graph: &Graph, locked: bool, ui: Ui) -> Result<(), Error> {
     let text = render(root, &graph.genes)?;
     let path = root.join(FILE_NAME);
     let current = match fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("Could not read '{}': {}", path.display(), e)),
+        Err(e) => {
+            return Err(Error::from(format!(
+                "Could not read '{}': {}",
+                path.display(),
+                e
+            )));
+        }
     };
     if current.as_deref() == Some(text.as_str()) {
         return Ok(());
     }
     if locked {
-        return Err(ui::with_help(
+        return Err(Error::with_help(
             format!("{} needs to be updated but --locked was passed.", FILE_NAME),
             "run again without --locked to update it",
         ));
@@ -45,12 +52,13 @@ pub fn sync(root: &Path, graph: &Graph, locked: bool, ui: Ui) -> Result<(), Stri
         "Locking",
         &format!("{} gene(s) in {}", graph.genes.len(), FILE_NAME),
     );
-    fs::write(&path, text).map_err(|e| format!("Could not write '{}': {}", path.display(), e))
+    fs::write(&path, text)
+        .map_err(|e| Error::from(format!("Could not write '{}': {}", path.display(), e)))
 }
 
-fn render(root: &Path, genes: &[Gene]) -> Result<String, String> {
+fn render(root: &Path, genes: &[Gene]) -> Result<String, Error> {
     let root = fs::canonicalize(root)
-        .map_err(|e| format!("Could not resolve '{}': {}", root.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not resolve '{}': {}", root.display(), e)))?;
     let gene = genes
         .iter()
         .map(|gene| {
@@ -60,8 +68,9 @@ fn render(root: &Path, genes: &[Gene]) -> Result<String, String> {
                 sha256: digest(&gene.dir)?,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    toml::to_string(&Lock { gene }).map_err(|e| format!("Could not render {}: {}", FILE_NAME, e))
+        .collect::<Result<Vec<_>, Error>>()?;
+    toml::to_string(&Lock { gene })
+        .map_err(|e| Error::from(format!("Could not render {}: {}", FILE_NAME, e)))
 }
 
 fn source(root: &Path, gene: &Gene) -> String {
@@ -71,11 +80,11 @@ fn source(root: &Path, gene: &Gene) -> String {
     }
 }
 
-fn digest(dir: &Path) -> Result<String, String> {
+pub fn digest(dir: &Path) -> Result<String, Error> {
     let src = dir.join("src");
     let mut files = Vec::new();
     collect_nk(&src, &mut files)
-        .map_err(|e| format!("Could not read '{}': {}", src.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not read '{}': {}", src.display(), e)))?;
     files.sort();
 
     let mut hasher = Sha256::new();
@@ -83,8 +92,8 @@ fn digest(dir: &Path) -> Result<String, String> {
         let rel = file.strip_prefix(dir).unwrap_or(file);
         hasher.update(slash(rel).as_bytes());
         hasher.update([0]);
-        let bytes =
-            fs::read(file).map_err(|e| format!("Could not read '{}': {}", file.display(), e))?;
+        let bytes = fs::read(file)
+            .map_err(|e| Error::from(format!("Could not read '{}': {}", file.display(), e)))?;
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }

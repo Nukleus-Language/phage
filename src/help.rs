@@ -32,6 +32,12 @@ pub const COMMANDS: &[Command] = &[
         options: LOCKED_OFFLINE,
     },
     Command {
+        name: "clean",
+        usage: "clean",
+        summary: "Remove the target directory of the project",
+        options: &[],
+    },
+    Command {
         name: "build",
         usage: "build [--release] [--locked] [--offline]",
         summary: "Build the project",
