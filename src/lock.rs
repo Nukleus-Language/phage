@@ -1,6 +1,7 @@
 use crate::{
     deps::{Gene, Graph, Source},
     git::redact,
+    ui::{self, Ui},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -23,7 +24,7 @@ struct Entry {
     sha256: String,
 }
 
-pub fn sync(root: &Path, graph: &Graph, locked: bool) -> Result<(), String> {
+pub fn sync(root: &Path, graph: &Graph, locked: bool, ui: Ui) -> Result<(), String> {
     let text = render(root, &graph.genes)?;
     let path = root.join(FILE_NAME);
     let current = match fs::read_to_string(&path) {
@@ -35,11 +36,15 @@ pub fn sync(root: &Path, graph: &Graph, locked: bool) -> Result<(), String> {
         return Ok(());
     }
     if locked {
-        return Err(format!(
-            "{} needs to be updated but --locked was passed.",
-            FILE_NAME
+        return Err(ui::with_help(
+            format!("{} needs to be updated but --locked was passed.", FILE_NAME),
+            "run again without --locked to update it",
         ));
     }
+    ui.status(
+        "Locking",
+        &format!("{} gene(s) in {}", graph.genes.len(), FILE_NAME),
+    );
     fs::write(&path, text).map_err(|e| format!("Could not write '{}': {}", path.display(), e))
 }
 
@@ -141,6 +146,7 @@ mod tests {
         }
         Ok(Gene {
             name: name.to_string(),
+            version: "0.1.0".to_string(),
             root: dir.join("src/lib.nk"),
             deps: Vec::new(),
             lints: BTreeMap::new(),
@@ -243,9 +249,9 @@ mod tests {
         let root = base.join("root");
         fs::create_dir_all(root.join("src"))?;
         let g = graph(vec![gene(&base, "a", &[("src/a.nk", "x")])?]);
-        let first = sync(&root, &g, false);
+        let first = sync(&root, &g, false, Ui::default());
         let written = fs::read_to_string(root.join(FILE_NAME))?;
-        let again = sync(&root, &g, true);
+        let again = sync(&root, &g, true, Ui::default());
         fs::remove_dir_all(&base)?;
         first.map_err(io::Error::other)?;
         again.map_err(io::Error::other)?;
@@ -260,12 +266,12 @@ mod tests {
         fs::create_dir_all(root.join("src"))?;
         let a = gene(&base, "a", &[("src/a.nk", "x")])?;
         let dir = a.dir.clone();
-        sync(&root, &graph(vec![a]), false).map_err(io::Error::other)?;
+        sync(&root, &graph(vec![a]), false, Ui::default()).map_err(io::Error::other)?;
         let before = fs::read_to_string(root.join(FILE_NAME))?;
 
         fs::write(dir.join("src/a.nk"), "changed")?;
         let changed = graph(vec![gene(&base, "a", &[("src/a.nk", "changed")])?]);
-        let result = sync(&root, &changed, false);
+        let result = sync(&root, &changed, false, Ui::default());
         let after = fs::read_to_string(root.join(FILE_NAME))?;
         fs::remove_dir_all(&base)?;
         result.map_err(io::Error::other)?;
@@ -280,7 +286,7 @@ mod tests {
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join(FILE_NAME), "stale\n")?;
         let g = graph(vec![gene(&base, "a", &[("src/a.nk", "x")])?]);
-        let result = sync(&root, &g, true);
+        let result = sync(&root, &g, true, Ui::default());
         let kept = fs::read_to_string(root.join(FILE_NAME))?;
         fs::remove_dir_all(&base)?;
         let err = result.unwrap_err();
@@ -294,7 +300,7 @@ mod tests {
         let base = temp_dir("locked_missing")?;
         let root = base.join("root");
         fs::create_dir_all(root.join("src"))?;
-        let result = sync(&root, &graph(Vec::new()), true);
+        let result = sync(&root, &graph(Vec::new()), true, Ui::default());
         let exists = root.join(FILE_NAME).exists();
         fs::remove_dir_all(&base)?;
         assert!(result.is_err());

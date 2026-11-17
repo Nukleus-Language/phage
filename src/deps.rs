@@ -17,6 +17,7 @@ pub struct Graph {
 #[derive(Debug)]
 pub struct Gene {
     pub name: String,
+    pub version: String,
     pub root: PathBuf,
     pub deps: Vec<(String, PathBuf)>,
     pub lints: BTreeMap<String, LintLevel>,
@@ -109,6 +110,7 @@ impl Walk<'_> {
                 name.clone(),
                 Gene {
                     name: name.clone(),
+                    version: dep_manifest.project.version.clone(),
                     root: root.clone(),
                     deps: Vec::new(),
                     lints: dep_manifest.lints.clone(),

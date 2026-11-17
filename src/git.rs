@@ -1,4 +1,7 @@
-use crate::manifest::GitDependency;
+use crate::{
+    manifest::GitDependency,
+    ui::{self, Ui},
+};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
@@ -9,6 +12,7 @@ use std::{
 pub struct Store {
     home: PathBuf,
     offline: bool,
+    ui: Ui,
 }
 
 #[derive(Debug)]
@@ -19,7 +23,16 @@ pub struct Checkout {
 
 impl Store {
     pub fn new(home: PathBuf, offline: bool) -> Store {
-        Store { home, offline }
+        Store {
+            home,
+            offline,
+            ui: Ui::default(),
+        }
+    }
+
+    pub fn with_ui(mut self, ui: Ui) -> Store {
+        self.ui = ui;
+        self
     }
 
     pub fn from_env(offline: bool) -> Result<Store, String> {
@@ -46,7 +59,7 @@ impl Store {
         }
         let key = format!("{}-{}", safe(name), short_hash(&dep.git));
         let bare = self.home.join("git").join(&key);
-        self.ensure_bare(&bare, &dep.git)?;
+        self.ensure_bare(&bare, name, &dep.git)?;
         let sha = self.resolve(&bare, name, dep)?;
         let dir = self.home.join("checkouts").join(&key).join(&sha);
         if !dir.is_dir() {
@@ -55,9 +68,11 @@ impl Store {
         Ok(Checkout { dir, sha })
     }
 
-    fn ensure_bare(&self, bare: &Path, url: &str) -> Result<(), String> {
+    fn ensure_bare(&self, bare: &Path, name: &str, url: &str) -> Result<(), String> {
         if bare.is_dir() {
             if !self.offline {
+                self.ui
+                    .status("Updating", &format!("{} ({})", name, redact(url)));
                 git(
                     Some(bare),
                     &[
@@ -74,12 +89,17 @@ impl Store {
             return Ok(());
         }
         if self.offline {
-            return Err(format!("--offline: no cached copy of '{}'", redact(url)));
+            return Err(ui::with_help(
+                format!("--offline: no cached copy of '{}'", redact(url)),
+                "run once without --offline to fill the cache",
+            ));
         }
         if let Some(parent) = bare.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Could not create '{}': {}", parent.display(), e))?;
         }
+        self.ui
+            .status("Downloading", &format!("{} ({})", name, redact(url)));
         git(
             None,
             &[
