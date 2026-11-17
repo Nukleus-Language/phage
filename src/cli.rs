@@ -1,83 +1,194 @@
-use crate::{build, project};
-use inksac::{Color, ColoredString, Style};
-use std::{env, process};
-
-const ERRORSTYLE: Style = Style {
-    foreground: Color::Red,
-    background: Color::Empty,
-    bold: false,
-    dim: false,
-    italic: false,
-    underline: false,
+use crate::{
+    build, help, project,
+    ui::{self, ColorChoice, Ui, Verbosity},
+};
+use std::{
+    env,
+    io::{self, IsTerminal},
+    process,
 };
 
-pub fn fail(msg: &str) -> ! {
-    eprintln!("{}", ColoredString::new(msg, ERRORSTYLE));
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Globals {
+    color: ColorChoice,
+    verbosity: Verbosity,
+}
+
+pub fn fail(color: bool, msg: &str) -> ! {
+    ui::print_error(msg, color);
     process::exit(1);
 }
 
 pub fn run(args: &[String]) {
-    if args.len() < 2 {
-        print_help_main();
-        process::exit(1);
-    }
+    let no_color = env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let stderr_tty = io::stderr().is_terminal();
+    let argv = args.get(1..).unwrap_or_default();
+    let (globals, rest) = split_globals(argv).unwrap_or_else(|e| {
+        fail(
+            ui::color_enabled(ColorChoice::Auto, no_color, stderr_tty),
+            &e,
+        )
+    });
+    let ui = Ui {
+        color: ui::color_enabled(globals.color, no_color, stderr_tty),
+        verbosity: globals.verbosity,
+    };
+    let stdout_color = ui::color_enabled(globals.color, no_color, io::stdout().is_terminal());
+    let code = dispatch(&rest, ui, stdout_color).unwrap_or_else(|e| fail(ui.color, &e));
+    process::exit(code);
+}
 
-    match args[1].as_str() {
-        "-v" | "--version" => {
+fn split_globals(args: &[String]) -> Result<(Globals, Vec<String>), String> {
+    let mut color = ColorChoice::default();
+    let mut quiet = false;
+    let mut verbose = false;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                rest.push(arg.clone());
+                rest.extend(iter.cloned());
+                break;
+            }
+            "-q" | "--quiet" => quiet = true,
+            "-v" | "--verbose" => verbose = true,
+            "--color" => {
+                let value = iter.next().ok_or_else(|| {
+                    ui::with_help("'--color' needs a value", "expected never, always or auto")
+                })?;
+                color = ColorChoice::parse(value)?;
+            }
+            other => match other.strip_prefix("--color=") {
+                Some(value) => color = ColorChoice::parse(value)?,
+                None => rest.push(arg.clone()),
+            },
+        }
+    }
+    if quiet && verbose {
+        return Err("'--verbose' and '--quiet' cannot be used together.".to_string());
+    }
+    let verbosity = match (quiet, verbose) {
+        (true, _) => Verbosity::Quiet,
+        (_, true) => Verbosity::Verbose,
+        _ => Verbosity::Normal,
+    };
+    Ok((Globals { color, verbosity }, rest))
+}
+
+fn dispatch(rest: &[String], ui: Ui, stdout_color: bool) -> Result<i32, String> {
+    let Some((name, args)) = rest.split_first() else {
+        print!("{}", help::main_help(stdout_color));
+        return Ok(1);
+    };
+    match name.as_str() {
+        "-V" | "--version" => {
             println!("Phage version 0.1.0");
+            Ok(0)
         }
         "-h" | "--help" => {
-            print_help_main();
+            print!("{}", help::main_help(stdout_color));
+            Ok(0)
         }
-        "init" => {
-            let (name, kind) = scaffold_args(&args[2..], "init").unwrap_or_else(|e| fail(&e));
-            if name.is_some() {
-                fail("'init' takes no project name; use 'new' for a new directory.");
+        "help" => {
+            match args.first() {
+                None => print!("{}", help::main_help(stdout_color)),
+                Some(topic) => {
+                    let command = help::find(topic).ok_or_else(|| unknown_command(topic))?;
+                    print!("{}", help::command_help(command, stdout_color));
+                }
             }
-            let path = env::current_dir()
-                .unwrap_or_else(|e| fail(&format!("Could not read the current directory: {}", e)));
-            project::init(&path, kind)
-                .unwrap_or_else(|e| fail(&format!("Could not create project: {}", e)));
+            Ok(0)
         }
-        "build" => {
-            let opts = flags(&args[2..], "build").unwrap_or_else(|e| fail(&e));
-            build::build(opts).unwrap_or_else(|e| fail(&e));
-        }
-        "check" => {
-            let opts = flags(&args[2..], "check").unwrap_or_else(|e| fail(&e));
-            if opts.release {
-                fail("Unknown option '--release' for 'check'.");
+        name => {
+            let command = help::find(name).ok_or_else(|| unknown_command(name))?;
+            if wants_help(args) {
+                print!("{}", help::command_help(command, stdout_color));
+                return Ok(0);
             }
-            build::check(opts).unwrap_or_else(|e| fail(&e));
+            match name {
+                "init" => init(args),
+                "new" => new(args),
+                "check" => check(args, ui),
+                "build" => build_cmd(args, ui),
+                "test" => test(args, ui),
+                "run" => run_cmd(args, ui),
+                _ => Err(unknown_command(name)),
+            }
         }
-        "test" => {
-            let (opts, filter) = test_flags(&args[2..]).unwrap_or_else(|e| fail(&e));
-            let code = build::test(opts, filter.as_deref()).unwrap_or_else(|e| fail(&e));
-            process::exit(code);
-        }
-        "run" => {
-            let (opts, program_args) = match args[2..].iter().position(|a| a == "--") {
-                Some(i) => (&args[2..2 + i], &args[3 + i..]),
-                None => (&args[2..], &args[args.len()..]),
-            };
-            let (jit, opts) = run_flags(opts).unwrap_or_else(|e| fail(&e));
-            let result = if jit {
-                build::run_jit(opts, program_args)
-            } else {
-                build::run(opts, program_args)
-            };
-            let code = result.unwrap_or_else(|e| fail(&e));
-            process::exit(code);
-        }
-        "new" => {
-            let (name, kind) = scaffold_args(&args[2..], "new").unwrap_or_else(|e| fail(&e));
-            let name = name.unwrap_or_else(|| fail("Please provide a project name."));
-            project::new(name, kind).unwrap_or_else(|e| fail(&e));
-        }
-        _ => {
-            println!("{}", ColoredString::new("Invalid command.", ERRORSTYLE));
-            process::exit(1);
-        }
+    }
+}
+
+fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
+fn unknown_command(name: &str) -> String {
+    let msg = format!("no such command: '{}'", name);
+    match help::suggest(name) {
+        Some(close) => ui::with_help(msg, format!("a similar command exists: '{}'", close)),
+        None => ui::with_help(msg, "run 'phage help' to list the commands"),
+    }
+}
+
+fn usage_error(msg: String, command: &str) -> String {
+    ui::with_help(msg, format!("run 'phage help {}' for usage", command))
+}
+
+fn init(args: &[String]) -> Result<i32, String> {
+    let (name, kind) = scaffold_args(args, "init").map_err(|e| usage_error(e, "init"))?;
+    if name.is_some() {
+        return Err("'init' takes no project name; use 'new' for a new directory.".to_string());
+    }
+    let path =
+        env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
+    project::init(&path, kind).map_err(|e| format!("Could not create project: {}", e))?;
+    Ok(0)
+}
+
+fn new(args: &[String]) -> Result<i32, String> {
+    let (name, kind) = scaffold_args(args, "new").map_err(|e| usage_error(e, "new"))?;
+    let name =
+        name.ok_or_else(|| usage_error("Please provide a project name.".to_string(), "new"))?;
+    project::new(name, kind)?;
+    Ok(0)
+}
+
+fn check(args: &[String], ui: Ui) -> Result<i32, String> {
+    let opts = flags(args, "check").map_err(|e| usage_error(e, "check"))?;
+    if opts.release {
+        return Err(usage_error(
+            "Unknown option '--release' for 'check'.".to_string(),
+            "check",
+        ));
+    }
+    build::check(opts, ui)?;
+    Ok(0)
+}
+
+fn build_cmd(args: &[String], ui: Ui) -> Result<i32, String> {
+    let opts = flags(args, "build").map_err(|e| usage_error(e, "build"))?;
+    build::build(opts, ui)?;
+    Ok(0)
+}
+
+fn test(args: &[String], ui: Ui) -> Result<i32, String> {
+    let (opts, filter) = test_flags(args).map_err(|e| usage_error(e, "test"))?;
+    build::test(opts, filter.as_deref(), ui)
+}
+
+fn run_cmd(args: &[String], ui: Ui) -> Result<i32, String> {
+    let (opts, program_args) = match args.iter().position(|a| a == "--") {
+        Some(i) => (&args[..i], &args[i + 1..]),
+        None => (args, &args[args.len()..]),
+    };
+    let (jit, opts) = run_flags(opts).map_err(|e| usage_error(e, "run"))?;
+    if jit {
+        build::run_jit(opts, program_args, ui)
+    } else {
+        build::run(opts, program_args, ui)
     }
 }
 
@@ -144,58 +255,6 @@ fn test_flags(args: &[String]) -> Result<(build::Options, Option<String>), Strin
         }
     }
     Ok((opts, filter))
-}
-
-fn print_help_main() {
-    let title_style = Style {
-        foreground: Color::Cyan,
-        ..Default::default()
-    };
-    let h2_style = Style {
-        foreground: Color::Yellow,
-        ..Default::default()
-    };
-    let h3_style = Style {
-        foreground: Color::Green,
-        ..Default::default()
-    };
-    println!(
-        "{}, a package and build manager for Nukleus",
-        ColoredString::new("Phage", title_style)
-    );
-    println!("\n{}:", ColoredString::new("Commands", h2_style));
-    println!(
-        "  {}               Create a new project in the current directory (--lib for a library)",
-        ColoredString::new("init", h3_style)
-    );
-    println!(
-        "  {}                Create a new project in a new directory (--lib for a library)",
-        ColoredString::new("new", h3_style)
-    );
-    println!(
-        "  {}              Type-check the project without linking",
-        ColoredString::new("check", h3_style)
-    );
-    println!(
-        "  {}              Build the project (--release for an optimized build, --locked to fail if Phage.lock would change, --offline to use only the git cache)",
-        ColoredString::new("build", h3_style)
-    );
-    println!(
-        "  {}                Build and run the tests of the project (--filter <text> runs only tests whose module.name contains text)",
-        ColoredString::new("test", h3_style)
-    );
-    println!(
-        "  {}                Build and run the project (args after -- go to the program; --jit runs it in lamina's JIT instead, x86_64 Linux only)",
-        ColoredString::new("run", h3_style)
-    );
-    println!(
-        "  {}        Print this message",
-        ColoredString::new("-h, --help ", h3_style)
-    );
-    println!(
-        "  {}      Prints the version",
-        ColoredString::new("-v, --version", h3_style)
-    );
 }
 
 #[cfg(test)]
@@ -308,5 +367,68 @@ mod tests {
     fn scaffold_args_rejects_second_name() {
         let err = scaffold_args(&args(&["a", "b"]), "new").unwrap_err();
         assert_eq!(err, "Unexpected argument 'b' for 'new'.");
+    }
+
+    #[test]
+    fn globals_are_taken_from_anywhere_before_program_args() {
+        let (globals, rest) = split_globals(&args(&[
+            "-q",
+            "build",
+            "--color=never",
+            "--release",
+            "run",
+            "--",
+            "-v",
+            "--color",
+        ]))
+        .unwrap();
+        assert_eq!(globals.verbosity, Verbosity::Quiet);
+        assert_eq!(globals.color, ColorChoice::Never);
+        assert_eq!(
+            rest,
+            args(&["build", "--release", "run", "--", "-v", "--color"])
+        );
+    }
+
+    #[test]
+    fn verbose_and_quiet_cannot_be_combined() {
+        let err = split_globals(&args(&["-v", "-q", "build"])).unwrap_err();
+        assert!(err.contains("cannot be used together"), "{err}");
+    }
+
+    #[test]
+    fn color_flag_needs_a_known_value() {
+        assert_eq!(
+            split_globals(&args(&["--color", "always", "check"]))
+                .unwrap()
+                .0
+                .color,
+            ColorChoice::Always
+        );
+        let err = split_globals(&args(&["--color", "sometimes"])).unwrap_err();
+        assert!(err.contains("sometimes"), "{err}");
+        let missing = split_globals(&args(&["--color"])).unwrap_err();
+        assert!(missing.contains("needs a value"), "{missing}");
+    }
+
+    #[test]
+    fn help_request_stops_at_double_dash() {
+        assert!(wants_help(&args(&["--release", "-h"])));
+        assert!(!wants_help(&args(&["--", "--help"])));
+    }
+
+    #[test]
+    fn unknown_command_suggests_closest_name() {
+        let err = unknown_command("buidl");
+        let (msg, hint) = ui::split_help(&err);
+        assert_eq!(msg, "no such command: 'buidl'");
+        assert_eq!(hint, Some("a similar command exists: 'build'"));
+    }
+
+    #[test]
+    fn usage_errors_point_at_command_help() {
+        let err = usage_error(flags(&args(&["--frozen"]), "build").unwrap_err(), "build");
+        let (_, hint) = ui::split_help(&err);
+        assert_eq!(hint, Some("run 'phage help build' for usage"));
     }
 }
