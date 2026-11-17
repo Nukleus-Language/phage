@@ -1,7 +1,5 @@
-use crate::{
-    manifest::GitDependency,
-    ui::{self, Ui},
-};
+use crate::error::Error;
+use crate::{manifest::GitDependency, ui::Ui};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
@@ -35,7 +33,7 @@ impl Store {
         self
     }
 
-    pub fn from_env(offline: bool) -> Result<Store, String> {
+    pub fn from_env(offline: bool) -> Result<Store, Error> {
         let home = match env::var_os("PHAGE_HOME") {
             Some(home) => PathBuf::from(home),
             None => PathBuf::from(
@@ -46,9 +44,12 @@ impl Store {
         Ok(Store::new(home, offline))
     }
 
-    pub fn checkout(&self, name: &str, dep: &GitDependency) -> Result<Checkout, String> {
+    pub fn checkout(&self, name: &str, dep: &GitDependency) -> Result<Checkout, Error> {
         if dep.rev.is_some() && dep.branch.is_some() {
-            return Err(format!("Dependency '{}' sets both rev and branch.", name));
+            return Err(Error::from(format!(
+                "Dependency '{}' sets both rev and branch.",
+                name
+            )));
         }
         reject_option(name, "url", &dep.git)?;
         if let Some(rev) = &dep.rev {
@@ -68,7 +69,7 @@ impl Store {
         Ok(Checkout { dir, sha })
     }
 
-    fn ensure_bare(&self, bare: &Path, name: &str, url: &str) -> Result<(), String> {
+    fn ensure_bare(&self, bare: &Path, name: &str, url: &str) -> Result<(), Error> {
         if bare.is_dir() {
             if !self.offline {
                 self.ui
@@ -89,14 +90,15 @@ impl Store {
             return Ok(());
         }
         if self.offline {
-            return Err(ui::with_help(
+            return Err(Error::with_help(
                 format!("--offline: no cached copy of '{}'", redact(url)),
                 "run once without --offline to fill the cache",
             ));
         }
         if let Some(parent) = bare.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Could not create '{}': {}", parent.display(), e))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::from(format!("Could not create '{}': {}", parent.display(), e))
+            })?;
         }
         self.ui
             .status("Downloading", &format!("{} ({})", name, redact(url)));
@@ -114,7 +116,7 @@ impl Store {
         Ok(())
     }
 
-    fn resolve(&self, bare: &Path, name: &str, dep: &GitDependency) -> Result<String, String> {
+    fn resolve(&self, bare: &Path, name: &str, dep: &GitDependency) -> Result<String, Error> {
         let spec = match (&dep.rev, &dep.branch) {
             (Some(rev), _) => rev.clone(),
             (None, Some(branch)) => format!("refs/heads/{}", branch),
@@ -135,16 +137,16 @@ impl Store {
                 }
             }
         }
-        Err(format!(
+        Err(Error::from(format!(
             "Could not resolve '{}' in '{}' for dependency '{}'.",
             spec,
             redact(&dep.git),
             name
-        ))
+        )))
     }
 }
 
-fn rev_parse(bare: &Path, object: &str) -> Result<String, String> {
+fn rev_parse(bare: &Path, object: &str) -> Result<String, Error> {
     git(
         Some(bare),
         &[
@@ -161,12 +163,12 @@ fn is_full_sha(rev: &str) -> bool {
     (rev.len() == 40 || rev.len() == 64) && rev.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn reject_option(name: &str, what: &str, value: &str) -> Result<(), String> {
+fn reject_option(name: &str, what: &str, value: &str) -> Result<(), Error> {
     if value.starts_with('-') {
-        return Err(format!(
+        return Err(Error::from(format!(
             "Dependency '{}' has a {} starting with '-'.",
             name, what
-        ));
+        )));
     }
     Ok(())
 }
@@ -211,10 +213,10 @@ fn strip_userinfo(rest: &str) -> &str {
     }
 }
 
-fn materialize(bare: &Path, dir: &Path, sha: &str) -> Result<(), String> {
+fn materialize(bare: &Path, dir: &Path, sha: &str) -> Result<(), Error> {
     if let Some(parent) = dir.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| format!("Could not create '{}': {}", parent.display(), e))?;
+            .map_err(|e| Error::from(format!("Could not create '{}': {}", parent.display(), e)))?;
     }
     let result = git(
         None,
@@ -233,7 +235,7 @@ fn materialize(bare: &Path, dir: &Path, sha: &str) -> Result<(), String> {
     })
 }
 
-fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
+fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, Error> {
     let mut cmd = Command::new("git");
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
@@ -251,11 +253,11 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
         })?;
     if !output.status.success() {
         let command: Vec<String> = args.iter().map(|arg| redact(arg)).collect();
-        return Err(format!(
+        return Err(Error::from(format!(
             "git {} failed: {}",
             command.join(" "),
             redact_text(String::from_utf8_lossy(&output.stderr).trim())
-        ));
+        )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }

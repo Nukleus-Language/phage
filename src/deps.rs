@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::{
     git::Store,
     manifest::{self, Dependency, FILE_NAME, LintLevel, Manifest},
@@ -31,9 +32,9 @@ pub enum Source {
     Git { url: String, sha: String },
 }
 
-pub fn collect(root: &Path, manifest: &Manifest, store: &Store) -> Result<Graph, String> {
+pub fn collect(root: &Path, manifest: &Manifest, store: &Store) -> Result<Graph, Error> {
     let root = fs::canonicalize(root)
-        .map_err(|e| format!("Could not resolve '{}': {}", root.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not resolve '{}': {}", root.display(), e)))?;
     let mut walk = Walk {
         store,
         genes: BTreeMap::new(),
@@ -57,7 +58,7 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    fn visit(&mut self, manifest: &Manifest, dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    fn visit(&mut self, manifest: &Manifest, dir: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
         let mut declared = Vec::new();
         for (name, dep) in &manifest.dependencies {
             let (canon, source) = self.locate(name, dep, dir)?;
@@ -68,39 +69,42 @@ impl Walk<'_> {
                     .map(|(n, _)| n.as_str())
                     .collect();
                 chain.push(name);
-                return Err(format!("Dependency cycle: {}", chain.join(" -> ")));
+                return Err(Error::from(format!(
+                    "Dependency cycle: {}",
+                    chain.join(" -> ")
+                )));
             }
 
             if let Some(seen) = self.packages.get(&canon) {
                 if seen != name {
-                    return Err(format!(
+                    return Err(Error::from(format!(
                         "Dependency at '{}' is reached as both '{}' and '{}'",
                         canon.display(),
                         seen,
                         name
-                    ));
+                    )));
                 }
                 declared.push((name.clone(), self.genes[name].root.clone()));
                 continue;
             }
 
             if let Some(existing) = self.genes.get(name) {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "Dependency '{}' resolves to both '{}' and '{}'",
                     name,
                     existing.dir.display(),
                     canon.display()
-                ));
+                )));
             }
 
             let manifest_path = canon.join(FILE_NAME);
             if !manifest_path.is_file() {
-                return Err(format!(
+                return Err(Error::from(format!(
                     "Dependency '{}' at '{}' has no {}",
                     name,
                     canon.display(),
                     FILE_NAME
-                ));
+                )));
             }
             let dep_manifest = manifest::load(&manifest_path)?;
             let root = canon.join(dep_manifest.lib_path());
@@ -129,12 +133,7 @@ impl Walk<'_> {
         Ok(declared)
     }
 
-    fn locate(
-        &self,
-        name: &str,
-        dep: &Dependency,
-        dir: &Path,
-    ) -> Result<(PathBuf, Source), String> {
+    fn locate(&self, name: &str, dep: &Dependency, dir: &Path) -> Result<(PathBuf, Source), Error> {
         match dep {
             Dependency::Path(path) => {
                 let candidate = dir.join(&path.path);

@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::manifest::{self, FILE_NAME};
 use std::{
     fs,
@@ -45,7 +46,7 @@ pub fn init(path: &Path, kind: Kind) -> io::Result<()> {
     Ok(())
 }
 
-pub fn new(dir: &str, kind: Kind) -> Result<(), String> {
+pub fn new(dir: &str, kind: Kind) -> Result<(), Error> {
     let path = Path::new(dir);
     fs::create_dir(path).map_err(|e| {
         if e.kind() == ErrorKind::AlreadyExists {
@@ -54,7 +55,7 @@ pub fn new(dir: &str, kind: Kind) -> Result<(), String> {
             format!("Could not create directory '{}': {}", dir, e)
         }
     })?;
-    init(path, kind).map_err(|e| format!("Could not create project: {}", e))
+    init(path, kind).map_err(|e| Error::from(format!("Could not create project: {}", e)))
 }
 
 #[cfg(test)]

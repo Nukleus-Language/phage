@@ -1,3 +1,4 @@
+use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -105,13 +106,16 @@ pub fn find_manifest(start: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-pub fn load(path: &Path) -> Result<Manifest, String> {
+pub fn load(path: &Path) -> Result<Manifest, Error> {
     let text = fs::read_to_string(path)
-        .map_err(|e| format!("Could not read '{}': {}", path.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not read '{}': {}", path.display(), e)))?;
     let manifest: Manifest = toml::from_str(&text)
-        .map_err(|e| format!("Could not parse '{}': {}", path.display(), e))?;
+        .map_err(|e| Error::from(format!("Could not parse '{}': {}", path.display(), e)))?;
     if manifest.project.name.is_empty() {
-        return Err(format!("'{}' is missing project.name", path.display()));
+        return Err(Error::from(format!(
+            "'{}' is missing project.name",
+            path.display()
+        )));
     }
     Ok(manifest)
 }

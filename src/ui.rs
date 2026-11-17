@@ -1,3 +1,4 @@
+use crate::error::Error;
 use inksac::{Color, ColoredString, Style};
 use std::{
     ffi::{OsStr, OsString},
@@ -5,7 +6,6 @@ use std::{
 };
 
 const VERB_WIDTH: usize = 12;
-const HINT_SEPARATOR: char = '\x1e';
 
 const fn style(foreground: Color) -> Style {
     Style {
@@ -34,12 +34,12 @@ pub enum ColorChoice {
 }
 
 impl ColorChoice {
-    pub fn parse(text: &str) -> Result<Self, String> {
+    pub fn parse(text: &str) -> Result<Self, Error> {
         match text {
             "auto" => Ok(ColorChoice::Auto),
             "always" => Ok(ColorChoice::Always),
             "never" => Ok(ColorChoice::Never),
-            other => Err(with_help(
+            other => Err(Error::with_help(
                 format!("invalid value '{}' for '--color'", other),
                 "expected never, always or auto",
             )),
@@ -104,22 +104,10 @@ pub fn help_line(hint: &str, color: bool) -> String {
     format!("{} {}", paint("help:", HINT, color), hint)
 }
 
-pub fn print_error(text: &str, color: bool) {
-    let (msg, hint) = split_help(text);
-    eprintln!("{}", error_line(msg, color));
-    if let Some(hint) = hint {
+pub fn print_error(err: &Error, color: bool) {
+    eprintln!("{}", error_line(&err.msg, color));
+    if let Some(hint) = &err.help {
         eprintln!("{}", help_line(hint, color));
-    }
-}
-
-pub fn with_help(msg: impl AsRef<str>, hint: impl AsRef<str>) -> String {
-    format!("{}{}{}", msg.as_ref(), HINT_SEPARATOR, hint.as_ref())
-}
-
-pub fn split_help(text: &str) -> (&str, Option<&str>) {
-    match text.split_once(HINT_SEPARATOR) {
-        Some((msg, hint)) => (msg, Some(hint)),
-        None => (text, None),
     }
 }
 
@@ -189,13 +177,10 @@ mod tests {
     }
 
     #[test]
-    fn hint_survives_split_and_message_stays_plain() {
-        let text = with_help("nukleus not found", "put it on PATH");
-        assert_eq!(
-            split_help(&text),
-            ("nukleus not found", Some("put it on PATH"))
-        );
-        assert_eq!(split_help("plain"), ("plain", None));
+    fn error_help_is_printed_separately_from_message() {
+        let err = Error::with_help("nukleus not found", "put it on PATH");
+        assert_eq!(err.msg, "nukleus not found");
+        assert_eq!(err.help.as_deref(), Some("put it on PATH"));
     }
 
     #[test]
