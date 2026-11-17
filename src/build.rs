@@ -1,17 +1,18 @@
 use crate::{
-    deps::{self, Gene, Graph},
-    git::Store,
+    deps::{self, Gene, Graph, Source},
+    git::{Store, redact},
     lock,
     manifest::{self, FILE_NAME, LintLevel, Manifest, find_manifest},
+    ui::{self, Ui},
 };
 use std::{
     collections::BTreeMap,
     env,
     ffi::{OsStr, OsString},
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
+    time::Instant,
 };
 
 const JIT_REFUSED_EXIT_CODE: i32 = 125;
@@ -31,14 +32,17 @@ struct Target {
     store: Store,
 }
 
-fn resolve(offline: bool) -> Result<Target, String> {
+fn resolve(offline: bool, ui: Ui) -> Result<Target, String> {
     let cwd =
         env::current_dir().map_err(|e| format!("Could not read the current directory: {}", e))?;
     let manifest_path = find_manifest(&cwd).ok_or_else(|| {
-        format!(
-            "No {} found in '{}' or any parent directory.",
-            FILE_NAME,
-            cwd.display()
+        ui::with_help(
+            format!(
+                "No {} found in '{}' or any parent directory.",
+                FILE_NAME,
+                cwd.display()
+            ),
+            "run 'phage init' or 'phage new <name>' to create a project",
         )
     })?;
     let root = manifest_path
@@ -51,8 +55,47 @@ fn resolve(offline: bool) -> Result<Target, String> {
         lamina: env::var_os("LAMINA").unwrap_or_else(|| OsString::from("lamina")),
         root,
         manifest,
-        store: Store::from_env(offline)?,
+        store: Store::from_env(offline)?.with_ui(ui),
     })
+}
+
+fn profile_name(release: bool) -> &'static str {
+    if release { "release" } else { "dev" }
+}
+
+fn finished(ui: Ui, profile: &str, start: Instant) {
+    ui.status(
+        "Finished",
+        &format!("`{}` profile in {}", profile, ui::elapsed(start)),
+    );
+}
+
+fn announce(ui: Ui, verb: &str, manifest: &Manifest, root: &Path, graph: &Graph) {
+    ui.status(
+        verb,
+        &package_line(
+            &manifest.project.name,
+            &manifest.project.version,
+            &root.display().to_string(),
+        ),
+    );
+    for gene in &graph.genes {
+        ui.status(
+            verb,
+            &package_line(&gene.name, &gene.version, &gene_location(gene)),
+        );
+    }
+}
+
+fn package_line(name: &str, version: &str, location: &str) -> String {
+    format!("{} v{} ({})", name, version, location)
+}
+
+fn gene_location(gene: &Gene) -> String {
+    match &gene.source {
+        Source::Path => gene.dir.display().to_string(),
+        Source::Git { url, sha } => format!("{}#{}", redact(url), &sha[..sha.len().min(8)]),
+    }
 }
 
 const BIN_ROOT: &str = "src/main.nk";
@@ -79,16 +122,20 @@ fn roots(root: &Path, manifest: &Manifest) -> Result<Roots, String> {
     Ok(roots)
 }
 
-pub fn test(opts: Options, filter: Option<&str>) -> Result<i32, String> {
-    let target = resolve(opts.offline)?;
-    sync_lock(&target, opts.locked)?;
-    test_with(
+pub fn test(opts: Options, filter: Option<&str>, ui: Ui) -> Result<i32, String> {
+    let start = Instant::now();
+    let target = resolve(opts.offline, ui)?;
+    sync_lock(&target, opts.locked, ui)?;
+    let code = test_with(
         &target.nukleus,
         &target.root,
         &target.manifest,
         &target.store,
         filter,
-    )
+        ui,
+    )?;
+    finished(ui, "test", start);
+    Ok(code)
 }
 
 /// Builds and runs a test runner for each root. Every root runs even if an earlier one fails;
@@ -99,6 +146,7 @@ fn test_with(
     manifest: &Manifest,
     store: &Store,
     filter: Option<&str>,
+    ui: Ui,
 ) -> Result<i32, String> {
     let roots = roots(root, manifest)?;
     let out_dir = root.join("target").join("test");
@@ -112,6 +160,7 @@ fn test_with(
     if let Some(lib) = &roots.lib {
         targets.push((lib.as_path(), format!("{}-lib", manifest.project.name)));
     }
+    announce(ui, "Compiling", manifest, root, &graph);
     let mut code = 0;
     for (input, name) in targets {
         let path = out_dir.join(name);
@@ -124,7 +173,9 @@ fn test_with(
             },
             &graph,
             &manifest.lints,
+            ui,
         )?;
+        ui.status("Running", &format!("`{}`", path.display()));
         let status = Command::new(&path)
             .current_dir(root)
             .status()
@@ -136,23 +187,26 @@ fn test_with(
     Ok(code)
 }
 
-fn sync_lock(target: &Target, locked: bool) -> Result<(), String> {
+fn sync_lock(target: &Target, locked: bool, ui: Ui) -> Result<(), String> {
     let graph = deps::collect(&target.root, &target.manifest, &target.store)?;
-    lock::sync(&target.root, &graph, locked)
+    lock::sync(&target.root, &graph, locked, ui)
 }
 
-pub fn build(opts: Options) -> Result<(), String> {
-    let target = resolve(opts.offline)?;
-    sync_lock(&target, opts.locked)?;
+pub fn build(opts: Options, ui: Ui) -> Result<(), String> {
+    let start = Instant::now();
+    let target = resolve(opts.offline, ui)?;
+    sync_lock(&target, opts.locked, ui)?;
     if let Some(note) = build_roots(
         &target.nukleus,
         &target.root,
         &target.manifest,
         &target.store,
         opts.release,
+        ui,
     )? {
         println!("{}", note);
     }
+    finished(ui, profile_name(opts.release), start);
     Ok(())
 }
 
@@ -162,15 +216,16 @@ fn build_roots(
     manifest: &Manifest,
     store: &Store,
     release: bool,
+    ui: Ui,
 ) -> Result<Option<String>, String> {
     let roots = roots(root, manifest)?;
     if roots.bin.is_some() {
-        build_with(nukleus, root, manifest, store, release)?;
+        build_with(nukleus, root, manifest, store, release, ui)?;
     }
     let Some(lib) = roots.lib else {
         return Ok(None);
     };
-    check_inputs(nukleus, root, manifest, store, &[lib.as_path()])?;
+    check_inputs(nukleus, root, manifest, store, &[lib.as_path()], ui)?;
     Ok(roots.bin.is_none().then(|| {
         format!(
             "No library artifact format yet; checked {}.",
@@ -179,9 +234,9 @@ fn build_roots(
     }))
 }
 
-pub fn run(opts: Options, program_args: &[String]) -> Result<i32, String> {
-    let target = resolve(opts.offline)?;
-    sync_lock(&target, opts.locked)?;
+pub fn run(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, String> {
+    let target = resolve(opts.offline, ui)?;
+    sync_lock(&target, opts.locked, ui)?;
     run_with(
         &target.nukleus,
         &target.root,
@@ -189,6 +244,7 @@ pub fn run(opts: Options, program_args: &[String]) -> Result<i32, String> {
         &target.store,
         opts.release,
         program_args,
+        ui,
     )
 }
 
@@ -199,8 +255,12 @@ fn run_with(
     store: &Store,
     release: bool,
     program_args: &[String],
+    ui: Ui,
 ) -> Result<i32, String> {
-    let binary = build_with(nukleus, root, manifest, store, release)?;
+    let start = Instant::now();
+    let binary = build_with(nukleus, root, manifest, store, release, ui)?;
+    finished(ui, profile_name(release), start);
+    ui.status("Running", &format!("`{}`", binary.display()));
     let status = Command::new(&binary)
         .args(program_args)
         .status()
@@ -208,12 +268,12 @@ fn run_with(
     Ok(status.code().unwrap_or(1))
 }
 
-pub fn run_jit(opts: Options, program_args: &[String]) -> Result<i32, String> {
+pub fn run_jit(opts: Options, program_args: &[String], ui: Ui) -> Result<i32, String> {
     if let Some(err) = jit_host_error(env::consts::ARCH, env::consts::OS) {
         return Err(err);
     }
-    let target = resolve(opts.offline)?;
-    sync_lock(&target, opts.locked)?;
+    let target = resolve(opts.offline, ui)?;
+    sync_lock(&target, opts.locked, ui)?;
     run_jit_with(
         &target.nukleus,
         &target.lamina,
@@ -222,13 +282,15 @@ pub fn run_jit(opts: Options, program_args: &[String]) -> Result<i32, String> {
         &target.store,
         opts.release,
         program_args,
+        ui,
     )
 }
 
 fn jit_host_error(arch: &str, os: &str) -> Option<String> {
     (arch != "x86_64" || os != "linux").then(|| {
-        format!(
-            "'run --jit' runs only on x86_64 Linux for now; this host is {arch} {os}. Use 'phage run' instead"
+        ui::with_help(
+            format!("'run --jit' runs only on x86_64 Linux for now; this host is {arch} {os}."),
+            "use 'phage run' instead",
         )
     })
 }
@@ -241,7 +303,9 @@ fn run_jit_with(
     store: &Store,
     release: bool,
     program_args: &[String],
+    ui: Ui,
 ) -> Result<i32, String> {
+    let start = Instant::now();
     let bin = roots(root, manifest)?
         .bin
         .ok_or_else(|| format!("no binary root: {} not found", BIN_ROOT))?;
@@ -249,36 +313,43 @@ fn run_jit_with(
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let graph = deps::collect(root, manifest, store)?;
+    announce(ui, "Compiling", manifest, root, &graph);
     compile(
         nukleus,
         &bin,
         &Output::Jit { out_dir: &out_dir },
         &graph,
         &manifest.lints,
+        ui,
     )?;
+    finished(ui, profile_name(release), start);
     let ir = out_dir
         .join(bin.file_stem().unwrap_or_default())
         .with_extension("lamina");
     let (program, args) = jit_command(lamina, &ir, release, program_args);
+    ui.status(
+        "Running",
+        &format!("`{}`", ui::render_command(&program, &args)),
+    );
     let status = Command::new(&program)
         .args(&args)
         .env("LAMINA_JIT_NO_FALLBACK", "1")
         .status()
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "lamina not found ('{}'): put it on PATH or set LAMINA to its path",
-                    program.to_string_lossy()
+                ui::with_help(
+                    format!("lamina not found ('{}')", program.to_string_lossy()),
+                    "put it on PATH or set LAMINA to its path",
                 )
             } else {
                 format!("Could not run '{}': {}", program.to_string_lossy(), e)
             }
         })?;
     match status.code().unwrap_or(1) {
-        JIT_REFUSED_EXIT_CODE => Err(
-            "lamina could not JIT this program (its reason is above). Use 'phage run' to build it ahead of time instead"
-                .to_string(),
-        ),
+        JIT_REFUSED_EXIT_CODE => Err(ui::with_help(
+            "lamina could not JIT this program (its reason is above)",
+            "use 'phage run' to build it ahead of time instead",
+        )),
         code => Ok(code),
     }
 }
@@ -301,15 +372,19 @@ fn jit_command(
     (lamina.to_os_string(), args)
 }
 
-pub fn check(opts: Options) -> Result<(), String> {
-    let target = resolve(opts.offline)?;
-    sync_lock(&target, opts.locked)?;
+pub fn check(opts: Options, ui: Ui) -> Result<(), String> {
+    let start = Instant::now();
+    let target = resolve(opts.offline, ui)?;
+    sync_lock(&target, opts.locked, ui)?;
     check_with(
         &target.nukleus,
         &target.root,
         &target.manifest,
         &target.store,
-    )
+        ui,
+    )?;
+    finished(ui, profile_name(false), start);
+    Ok(())
 }
 
 fn check_with(
@@ -317,6 +392,7 @@ fn check_with(
     root: &Path,
     manifest: &Manifest,
     store: &Store,
+    ui: Ui,
 ) -> Result<(), String> {
     let roots = roots(root, manifest)?;
     let inputs: Vec<&Path> = roots
@@ -325,7 +401,7 @@ fn check_with(
         .chain(roots.lib.iter())
         .map(PathBuf::as_path)
         .collect();
-    check_inputs(nukleus, root, manifest, store, &inputs)
+    check_inputs(nukleus, root, manifest, store, &inputs, ui)
 }
 
 fn check_inputs(
@@ -334,11 +410,15 @@ fn check_inputs(
     manifest: &Manifest,
     store: &Store,
     inputs: &[&Path],
+    ui: Ui,
 ) -> Result<(), String> {
     let out_dir = root.join("target").join("check");
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let graph = deps::collect(root, manifest, store)?;
+    if !inputs.is_empty() {
+        announce(ui, "Checking", manifest, root, &graph);
+    }
     for input in inputs {
         compile(
             nukleus,
@@ -346,6 +426,7 @@ fn check_inputs(
             &Output::Check { out_dir: &out_dir },
             &graph,
             &manifest.lints,
+            ui,
         )?;
     }
     Ok(())
@@ -357,6 +438,7 @@ fn build_with(
     manifest: &Manifest,
     store: &Store,
     release: bool,
+    ui: Ui,
 ) -> Result<PathBuf, String> {
     let bin = roots(root, manifest)?
         .bin
@@ -367,6 +449,7 @@ fn build_with(
         .map_err(|e| format!("Could not create '{}': {}", out_dir.display(), e))?;
     let out = out_dir.join(&manifest.project.name);
     let graph = deps::collect(root, manifest, store)?;
+    announce(ui, "Compiling", manifest, root, &graph);
     compile(
         nukleus,
         &bin,
@@ -376,6 +459,7 @@ fn build_with(
         },
         &graph,
         &manifest.lints,
+        ui,
     )?;
     Ok(out)
 }
@@ -386,6 +470,7 @@ fn compile(
     output: &Output,
     graph: &Graph,
     lints: &BTreeMap<String, LintLevel>,
+    ui: Ui,
 ) -> Result<(), String> {
     let (program, args) = compile_command(&CompileCommand {
         nukleus,
@@ -394,11 +479,15 @@ fn compile(
         graph,
         lints,
     });
+    ui.verbose(
+        "Running",
+        &format!("`{}`", ui::render_command(&program, &args)),
+    );
     let status = Command::new(&program).args(&args).status().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            format!(
-                "nukleus not found ('{}'): put it on PATH or set NUKLEUS to its path",
-                program.to_string_lossy()
+            ui::with_help(
+                format!("nukleus not found ('{}')", program.to_string_lossy()),
+                "put it on PATH or set NUKLEUS to its path",
             )
         } else {
             format!("Could not run '{}': {}", program.to_string_lossy(), e)
@@ -747,6 +836,7 @@ mod tests {
             genes: vec![
                 Gene {
                     name: "a".to_string(),
+                    version: "0.1.0".to_string(),
                     root: PathBuf::from("/p/a/src/lib.nk"),
                     deps: vec![("b".to_string(), PathBuf::from("/p/b/src/lib.nk"))],
                     lints: BTreeMap::from([("never_mutated".to_string(), LintLevel::Deny)]),
@@ -755,6 +845,7 @@ mod tests {
                 },
                 Gene {
                     name: "b".to_string(),
+                    version: "0.1.0".to_string(),
                     root: PathBuf::from("/p/b/src/lib.nk"),
                     deps: Vec::new(),
                     lints: BTreeMap::new(),
@@ -845,8 +936,15 @@ chmod +x \"$out\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
 
-            let out = build_with(nukleus.as_os_str(), &root, &demo(), &store(&root), false)
-                .map_err(io::Error::other)?;
+            let out = build_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             assert_eq!(out, root.join("target/debug/demo"));
             assert!(out.is_file());
             fs::remove_dir_all(&root)?;
@@ -860,8 +958,15 @@ chmod +x \"$out\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, "#!/bin/sh\nexit 3\n")?;
 
-            let err =
-                build_with(nukleus.as_os_str(), &root, &demo(), &store(&root), true).unwrap_err();
+            let err = build_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                true,
+                Ui::default(),
+            )
+            .unwrap_err();
             assert_eq!(err, "build failed");
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -881,6 +986,7 @@ chmod +x \"$out\"
                 &store(&root),
                 true,
                 &[],
+                Ui::default(),
             )
             .map_err(io::Error::other)?;
             assert_eq!(code, 7);
@@ -894,8 +1000,15 @@ chmod +x \"$out\"
             let root = project("missing")?;
             let nukleus = root.join("no-such-nukleus");
 
-            let err =
-                build_with(nukleus.as_os_str(), &root, &demo(), &store(&root), false).unwrap_err();
+            let err = build_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+                Ui::default(),
+            )
+            .unwrap_err();
             assert!(err.contains("NUKLEUS"), "{err}");
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -926,8 +1039,14 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            check_with(nukleus.as_os_str(), &root, &demo(), &store(&root))
-                .map_err(io::Error::other)?;
+            check_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             let written = root.join("target/check/lib.lamina").is_file();
             fs::remove_dir_all(&root)?;
             assert!(written);
@@ -942,8 +1061,14 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            check_with(nukleus.as_os_str(), &root, &demo(), &store(&root))
-                .map_err(io::Error::other)?;
+            check_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             let written = root.join("target/check/main.lamina").is_file()
                 && root.join("target/check/lib.lamina").is_file();
             fs::remove_dir_all(&root)?;
@@ -958,8 +1083,15 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            let note = build_roots(nukleus.as_os_str(), &root, &demo(), &store(&root), false)
-                .map_err(io::Error::other)?;
+            let note = build_roots(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             let checked = root.join("target/check/lib.lamina").is_file();
             let no_binary = !root.join("target/debug/demo").exists();
             fs::remove_dir_all(&root)?;
@@ -978,8 +1110,15 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
 
-            let note = build_roots(nukleus.as_os_str(), &root, &demo(), &store(&root), false)
-                .map_err(io::Error::other)?;
+            let note = build_roots(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                false,
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             let built = root.join("target/debug/demo").is_file();
             fs::remove_dir_all(&root)?;
             assert_eq!(note, None);
@@ -1001,6 +1140,7 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
                 &store(&root),
                 false,
                 &[],
+                Ui::default(),
             )
             .unwrap_err();
             let checked = root.join("target/check/lib.lamina").exists();
@@ -1028,8 +1168,14 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_CHECK)?;
 
-            check_with(nukleus.as_os_str(), &root, &demo(), &store(&root))
-                .map_err(io::Error::other)?;
+            check_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             assert!(root.join("target/check/main.lamina").is_file());
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -1042,8 +1188,15 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, FAKE_NUKLEUS)?;
 
-            let code = test_with(nukleus.as_os_str(), &root, &demo(), &store(&root), None)
-                .map_err(io::Error::other)?;
+            let code = test_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                None,
+                Ui::default(),
+            )
+            .map_err(io::Error::other)?;
             assert_eq!(code, 7);
             assert!(root.join("target/test/demo").is_file());
             Ok(())
@@ -1062,6 +1215,7 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
                 &demo(),
                 &store(&root),
                 Some("x"),
+                Ui::default(),
             )
             .map_err(io::Error::other)?;
             assert_eq!(code, 7);
@@ -1077,8 +1231,15 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, "#!/bin/sh\nexit 1\n")?;
 
-            let err =
-                test_with(nukleus.as_os_str(), &root, &demo(), &store(&root), None).unwrap_err();
+            let err = test_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                None,
+                Ui::default(),
+            )
+            .unwrap_err();
             assert_eq!(err, "test build failed");
             Ok(())
         }
@@ -1090,7 +1251,14 @@ mkdir -p \"$dir\" && echo ir > \"$dir/$(basename \"$last\" .nk).lamina\"
             let nukleus = root.join("fake-nukleus");
             write_exec(&nukleus, "#!/bin/sh\nexit 1\n")?;
 
-            let err = check_with(nukleus.as_os_str(), &root, &demo(), &store(&root)).unwrap_err();
+            let err = check_with(
+                nukleus.as_os_str(),
+                &root,
+                &demo(),
+                &store(&root),
+                Ui::default(),
+            )
+            .unwrap_err();
             assert_eq!(err, "check failed");
             fs::remove_dir_all(&root)?;
             Ok(())
@@ -1119,6 +1287,7 @@ exit 7
                 &store(&root),
                 false,
                 &[],
+                Ui::default(),
             )
             .map_err(io::Error::other)?;
             assert_eq!(code, 7);
@@ -1146,6 +1315,7 @@ exit 7
                 &store(&root),
                 false,
                 &["a".to_string(), "b c".to_string()],
+                Ui::default(),
             )
             .map_err(io::Error::other)?;
             assert_eq!(code, 7);
@@ -1172,6 +1342,7 @@ exit 7
                 &store(&root),
                 false,
                 &[],
+                Ui::default(),
             )
             .unwrap_err();
             assert!(err.contains("phage run"), "{err}");
@@ -1195,6 +1366,7 @@ exit 7
                 &store(&root),
                 false,
                 &[],
+                Ui::default(),
             )
             .map_err(io::Error::other)?;
             assert_eq!(code, 1);
@@ -1217,6 +1389,7 @@ exit 7
                 &store(&root),
                 false,
                 &[],
+                Ui::default(),
             )
             .unwrap_err();
             assert!(err.contains("LAMINA"), "{err}");
