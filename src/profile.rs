@@ -31,7 +31,7 @@ impl Profile {
 fn builtin_opt_level(name: &str) -> Option<u8> {
     match name {
         "dev" => Some(0),
-        "release" => Some(2),
+        "release" => Some(3),
         _ => None,
     }
 }
@@ -106,7 +106,7 @@ mod tests {
         let dev = Profile::resolve("dev", &none).unwrap();
         let release = Profile::resolve("release", &none).unwrap();
         assert_eq!((dev.opt_level, dev.dir.as_str()), (0, "debug"));
-        assert_eq!((release.opt_level, release.dir.as_str()), (2, "release"));
+        assert_eq!((release.opt_level, release.dir.as_str()), (3, "release"));
     }
 
     #[test]

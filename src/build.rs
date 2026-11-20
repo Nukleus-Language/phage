@@ -935,7 +935,7 @@ mod tests {
     fn compile_command_release_optimizes() {
         let (_, args) = command(
             Path::new("/p/target/release/demo"),
-            2,
+            3,
             &no_graph(),
             &BTreeMap::new(),
         );
@@ -944,7 +944,7 @@ mod tests {
             vec![
                 OsString::from("-o"),
                 OsString::from("/p/target/release/demo"),
-                OsString::from("-O2"),
+                OsString::from("-O3"),
                 OsString::from("/p/src/main.nk"),
             ]
         );
